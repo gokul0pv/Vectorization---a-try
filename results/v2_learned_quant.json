@@ -1,0 +1,22 @@
+[
+ {
+  "image": "img27",
+  "N": 8000,
+  "kept": 7927,
+  "mode": "sq",
+  "lam": 0.05,
+  "bytes": 34291,
+  "bpp": 1.674,
+  "psnr_float": 43.78,
+  "psnr_file": 38.2,
+  "png_bytes": 200614,
+  "enc_s": 20.4,
+  "dec_s": 0.23,
+  "jpeg": 33.48,
+  "jpeg_bytes_same_psnr": 65900,
+  "webp": 34.78,
+  "webp_bytes_same_psnr": null,
+  "avif": 40.54,
+  "avif_bytes_same_psnr": 23849
+ }
+]

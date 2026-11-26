@@ -1,0 +1,13 @@
+# generated outputs (benchmarks write here; cache holds big fitted models)
+out/
+out_log.txt
+__pycache__/
+*.pyc
+
+# build products
+gsq_rs/target/
+gsq_cpp/*.exe
+gsq_cuda/*.dll
+gsq_cuda/*.lib
+gsq_cuda/*.exp
+*.pt
