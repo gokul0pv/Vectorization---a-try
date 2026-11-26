@@ -41,6 +41,14 @@ def to_im(t):
     return Image.fromarray((t.clamp(0, 1) * 255 + 0.5).byte().cpu().numpy())
 
 
+def psnr8(rec, tgt):
+    """PSNR of the decoded picture after rounding to 8-bit pixels (as saved)."""
+    r = (rec.clamp(0, 1) * 255 + 0.5).floor()
+    t = (tgt * 255).round()
+    mse = ((r - t) ** 2).mean().item()
+    return 10 * math.log10(255 ** 2 / max(mse, 1e-12))
+
+
 def curve(im, fmt):
     """[(bytes, psnr, save_kwargs)] over qualities and colour options."""
     ref = np.asarray(im, np.float64) / 255
@@ -129,7 +137,8 @@ def main():
                     rec = render_decoded(d)
                     torch.cuda.synchronize()
                     t_dec = time.time() - t1
-                    p = psnr(rec, tgt)
+                    # measured on the real 8-bit picture, exactly like JPEG/WebP/AVIF
+                    p = psnr8(rec, tgt)
                     to_im(rec).save(OUT / f"{stem}_gs.png")
                 row = dict(image=name, N=N, kept=int(d["xy"].shape[0]), mode=a.mode, lam=lam,
                            bytes=len(buf), bpp=round(8 * len(buf) / (im.width * im.height), 3),

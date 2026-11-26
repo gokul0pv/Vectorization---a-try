@@ -15,6 +15,27 @@ What you get from storing shapes:
 
 ---
 
+## Samples
+
+Three sample images, each at its best setting. Every folder in [`samples/`](samples/) holds:
+- the original
+- the blob file (`.gsq`)
+- the decoded picture
+- a **4× render from the same file**
+- AVIF at the same size
+
+| Sample | Our file | Best of JPEG / WebP / AVIF for the same quality |
+|---|---|---|
+| [Glossy spheres](samples/spheres/) (ray-traced here) | **20.8 KB**, 48.6 dB | 28.2 KB → ours **26% smaller** |
+| [Colour ribbons](samples/ribbons/) (generated here) | **24.8 KB**, 49.3 dB | 39.7 KB → ours **38% smaller** |
+| [Earthrise](samples/earthrise/) (NASA, public domain) | 47.6 KB, 46.9 dB | 16.4 KB → ours **2.9× bigger** (photos are not its strength) |
+
+![Ribbons: original, blob file, AVIF at the same size, the blobs, zooms, 2× render](samples/ribbons/comparison.png)
+
+![Spheres: original, blob file, AVIF at the same size, the blobs, zooms, 2× render](samples/spheres/comparison.png)
+
+---
+
 ## How it works
 
 ```mermaid
@@ -87,6 +108,8 @@ flowchart TB
 | Natural camera photos | ❌ 25–35% bigger |
 | Text, charts, screenshots | ❌❌ 6–10× bigger (even plain PNG is smaller) |
 
+*Measurement note:* the milestone results (v1–v5 and the charts above) measured our quality before rounding the decoded picture to 8-bit pixels, while the other formats were measured after. That flatters us by about 0.1–0.2 dB at 45 dB and about 0.5 dB at 49 dB. `bench.py` now measures everything on the 8-bit picture, and the samples above use that fair measure (`rescore8.py`).
+
 **Why:** soft blobs suit soft things such as gloss, gradients and curves. Text and thin lines have razor-sharp edges, so each letter needs many tiny blobs. In the blob view below you can see them "scribbling" the letters. That's the reason for the *sharp-edge shapes* next step.
 
 ![Text document: original, blob file, AVIF, the blobs, zooms](docs/figure_doc.png)
@@ -117,6 +140,8 @@ flowchart TB
 | `bench.py` | Fit, compress, decode, compare against JPEG / WebP / AVIF |
 | `make_charts.py`, `make_figure.py` | The charts and figures in this README |
 | `make_tests.py`, `testimgs/` | Synthetic screenshot-type test images |
+| `make_samples.py`, `publish_samples.py`, `samples/` | Sample images (ray-traced, generated, NASA) and their best outputs |
+| `rescore8.py` | Re-measures saved results on 8-bit pictures (fair PSNR) |
 | `results/` | Benchmark numbers for every milestone (JSON) |
 | `docs/TECHNICAL.md` | Format details, commands, what was tried |
 
