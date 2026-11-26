@@ -144,6 +144,7 @@ flowchart TB
 | `rescore8.py` | Re-measures saved results on 8-bit pictures (fair PSNR) |
 | `results/` | Benchmark numbers for every milestone (JSON) |
 | `docs/TECHNICAL.md` | Format details, commands, what was tried |
+| `docs/RESEARCH.md` | **Research map:** papers, books and open source from 1980 to 2026, and the ranked next steps |
 
 The photo test images were Windows wallpapers. They're copyrighted, so they aren't included; use your own images.
 
@@ -158,3 +159,7 @@ gsq_cpp/gsq_view.exe out/my_image_8000_sq_1.0.gsq picture.png --scale 4 --csv bl
 ```
 
 Build commands for the Rust, C++ and CUDA parts are in [docs/TECHNICAL.md](docs/TECHNICAL.md).
+
+## Further reading
+
+[docs/RESEARCH.md](docs/RESEARCH.md) maps the related work, from vector quantization (1980) and JBIG2 to GaussianImage, Cool-chic, Beta and triangle splatting, and LLM-to-SVG models (2026). It explains what each could add here and ends with a ranked plan.
