@@ -67,7 +67,9 @@ for name in INFO:
     shutil.copy(OUT / f"figure_{best['image']}.png", d / "comparison.png")
     m = margin(best)
     need = [best[f"{c}_bytes_same_psnr"] for c in CODECS if best.get(f"{c}_bytes_same_psnr")]
-    if m > 0:
+    if m > 0 and need and min(need) <= best["bytes"] * 1.02:
+        verdict = f"➖ about even: +{m:.2f} dB at the same size, but the best needs {min(need) / 1024:.1f} KB for our quality"
+    elif m > 0:
         verdict = f"✅ **+{m:.2f} dB** over the best of them; " + (
             f"the best needs {min(need) / 1024:.1f} KB for our quality" if need
             else "none of them reaches our quality at any size")

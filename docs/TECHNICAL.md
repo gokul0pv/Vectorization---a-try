@@ -1,89 +1,105 @@
 # Technical notes
 
-A pixel image is turned into a few thousand soft elliptical blobs (2D Gaussians), fitted on the GPU, and stored in a small file. The file renders at any resolution.
+A pixel image is turned into layers of simple parts, fitted on the GPU, and stored in a small file:
 
 ```
-pixel = base_grid(p) + sum_i colour_i * exp(-0.5 * d^T Sigma_i^-1 d)
+pixel = base_grid(p)                                   tiny bicubic colour grid
+      + sum over boxes      colour_b * [p inside box b]   flat panels, bars, 1 px lines
+      + sum over blobs      colour_i * w(p - position_i)   soft ellipses (2D Gaussians)
+      + sum over copies c   sum over the blobs of prototype(c), moved to c's position
 ```
 
-## Codec `.gsq` (default, `--mode sq`)
-1. **Fit** (`gsimg/model.py`): 6000 Adam steps. Blob radius is limited to 20 px. Every 250 steps, the weakest 3% of blobs are moved to where the error is largest.
-2. **Learned quantisation** (`gsimg/sq.py`): each blob's shape (log a, b, log c) and colour (YCoCg) are snapped to a per-channel grid whose step is learned. Training minimises `bits + λ·255²·MSE`, with a Laplace rate model per channel. Blobs drift to cheap, common values, and invisible ones (colour exactly 0) are dropped.
-3. **Positions**: kept to 1/16 px (1/4 px cost 4–9 dB) and coded in 8 px bands.
-4. **Entropy coding** (`gsimg/ac.py`): an adaptive arithmetic coder, written in pure Python.
+The blobs drawn by copies are the **symbol layer**: a shape that repeats, such as a letter or an icon, is stored once as a group of blobs (a prototype), and each copy is just a prototype number and a position. All layers are trained together, so a prototype learns from every copy of itself. A blob's weight is `w = exp(-q/2)`, where `q = dᵀ Σ⁻¹ d`. A file may instead store Beta blobs, `w = (1 - q/2k)₊^k` with a sharpness `k` per blob.
 
-`λ` trades size against quality. The number of blobs `N` sets the quality ceiling.
+## Codec `.gsq` (`--mode sq`, the default)
 
-## Older codec `.gsi` (`--mode vq`)
-`gsimg/codec.py` holds k-means shape and colour codebooks (256 entries each, 1 byte per index). It's about 4 dB worse; kept for comparison.
+1. **Find layers** (`bench.py --symbols`, `gsimg/rects.py`, `gsimg/symbols.py`), only for pictures that have them:
+   - **Boxes:** flat regions are connected areas of one exact colour in the picture with small detail replaced by its local background (median, 15 px). Each region becomes one bounding box if the region plus the regions inside the box fill at least 85% of it. Boxes add their colour, so nested boxes fill the holes. Thin lines are long single-colour runs in the remaining detail. Boxes are pixel-aligned and drawn exactly with a difference image and two prefix sums.
+   - **Symbols:** these are small shapes that differ from their local background, found as connected components. Shapes with the same box and a mean difference below 6 levels are one prototype, and only shapes that occur at least twice are used. A prototype gets about one blob per two ink pixels (3 to 40).
+2. **Fit** (`gsimg/model.py`): Adam for 6000 steps, with blob radius limited to 20 px. Every 250 steps, the weakest 3% of blobs move to where the error is largest. One step (render, backward, fused Adam with tensor learning rates) is captured once as a **CUDA graph** and replayed; relocation runs eagerly between replays. `GSQ_GRAPHS=0` turns this off.
+3. **Learned quantisation** (`gsimg/sq.py`): each blob's shape (log a, b, log c), colour (YCoCg) and, for Beta files, log k are snapped to per-channel grids whose steps are learned. Training minimises `bits + λ·255²·MSE` with a Laplace rate model per channel. Blobs drift to cheap, common values; blobs whose colour rounds to exactly 0 are dropped.
+4. **Adaptive precision**: the decoder computes all of these from values it has already read, so they cost no bits.
+   - **Shape:** strong blobs get a finer shape step and faint blobs a coarser one. The step is multiplied by `2^-g`, where `g = round(log2(amp / 0.05))` is clipped to −2…2 and `amp` is the blob's quantised colour amplitude. Colour is coded first, and each shape channel is coded per group `g` with its own model.
+   - **Position:** the step is `2^-e` px, up to 1/128 px, with `e` from the blob's sharpness and colour amplitude.
+5. **Entropy coding** (`gsimg/ac.py`): an adaptive arithmetic coder in pure Python. Each column with more than 64 values tries three codings and keeps the smallest: direct, bit-length, and bucketed (`value >> s` adaptively plus `s` raw bits).
+
+`λ` trades size against quality, and the number of blobs `N` sets the quality ceiling. With layers, `N` counts free blobs plus prototype blobs, the ones actually stored.
+
+### File format `GSQ4`
+
+A header holds size, `R`, the blob count, `K_POS` and a flags byte, followed by these optional parts:
+- **bit 0:** Beta blobs, adding a 7th channel log k.
+- **bit 1:** adaptive shape precision, followed by float aref and byte G.
+- **bit 2:** symbol layer, followed by P prototypes, C copies and the copy position step.
+- **bit 3:** boxes, followed by the box count.
+
+Then come the learned steps and one 7-byte header per coded column, then the arithmetic-coded body in this order:
+1. base grid
+2. free blobs (band counts, x deltas, rows in band, attribute columns, position fraction bits)
+3. prototypes (blob counts, attribute columns, positions with adaptive fractions)
+4. copies in reading order (prototype id, row delta, x delta; 1/64 px)
+5. boxes in reading order (row delta, x0, width, height, r, g, b at 1/510)
+
+`GSQ2` files (6 channels, base step 1/127.5) still decode, pixel-identically.
 
 ## Run
-Encode and benchmark with the fast GPU kernels (Triton):
+
 ```
-<gsq-env>/Scripts/python.exe bench.py IMG [IMG...] --n 4000,8000 --lam 0.3,1.0 --tag NAME
+<gsq-env>/Scripts/python.exe bench.py IMG [IMG...] --n 4000,8000 --lam 0.2,0.8 --tag NAME
+<gsq-env>/Scripts/python.exe bench.py screenshot.png --n 1000,2000 --lam 0.02,0.05 --symbols --tag NAME
+<gsq-env>/Scripts/python.exe bench.py IMG --beta ...          # Beta blobs
 ```
-`<gsq-env>` is a Python 3.12 venv with torch 2.11 (CUDA 12.8) and triton-windows 3.7.1. Without Triton, the code falls back to plain PyTorch, which is about 7× slower per step.
+
+`<gsq-env>` is a Python 3.12 venv with torch 2.11 (CUDA 12.8), triton-windows 3.7.1 and pillow-jxl-plugin 1.3.8.
 
 Results:
 - `out/results_NAME.json`
 - `out/*_gs.png`: decoded image
 - `out/*_avif.png`: AVIF at the same size
 
-Baselines are fair: the best of 4:2:0 and 4:4:4 colour for JPEG and AVIF, and sharp-YUV for WebP. Fits are cached in `out/cache`.
+Baselines:
+- JPEG and AVIF: the best of 4:2:0 and 4:4:4 colour.
+- WebP: sharp YUV.
+- JPEG XL: effort 7, plus its lossless size.
 
-## Decoder in Rust: `gsq_rs/`
-```
-gsq_rs/target/release/gsq_view.exe IN.gsq OUT.png [--scale 4] [--csv blobs.csv]
-```
-- No Python and no GPU needed.
-- Decodes in 3–7 ms and renders in about 50 ms on all CPU cores, matching Python within 1 brightness level.
-- `--scale` draws at any size; `--csv` lists every blob (x, y, shape, colour).
-- Build: `PATH=%USERPROFILE%\.cargo\bin;%LOCALAPPDATA%\mingw-binutils\bin` then `cargo build --release --offline`.
+Fits are cached in `out/cache`. `get_kodak.sh` downloads the Kodak set (`kodak/`, not committed).
 
-## Decoder in C++: `gsq_cpp/`
-- `gsq.hpp` is a single-header library (C++17, no dependencies) that any C++ program can include:
-  `gsq::Blobs b = gsq::decode(bytes); auto rgb = gsq::render(b, scale, &w, &h);`
-- `gsq_view.cpp` is the same CLI as the Rust one (`--scale`, `--csv`). Its PNG writer is built in and uncompressed, so output files are about 4× bigger than the Rust ones but written faster.
-- Compiler: GCC 16.2 (WinLibs MinGW-w64 UCRT) at `%LOCALAPPDATA%\winlibs-gcc16\mingw64\bin`; no install or admin rights needed.
-- Build:
-  ```
-  set PATH=%LOCALAPPDATA%\winlibs-gcc16\mingw64\bin;%PATH%
-  g++ -O3 -march=native -std=c++17 gsq_view.cpp -o gsq_view.exe -static
-  ```
-- Matches Python within 1 level on all 28 test files.
+## Decoders
 
-Rendering 8k blobs:
-| Output | C++ | Rust |
-|---|---|---|
-| 512×320 | 28 ms | 60 ms |
-| 2048×1280 | 450 ms | 800 ms |
+- **Rust (`gsq_rs/`):** `gsq_view.exe IN.gsq OUT.png [--scale 4] [--csv blobs.csv]`. Build: `cargo build --release --offline` with `%USERPROFILE%\.cargo\bin` and the MinGW `bin` on PATH.
+- **C++ (`gsq_cpp/`):** `gsq.hpp` is a single-header library (C++17, no dependencies), used as `gsq::Blobs b = gsq::decode(bytes); auto rgb = gsq::render(b, scale, &w, &h);`. `gsq_view.cpp` is the same command-line tool as the Rust one. Build with GCC 16.2 (WinLibs, `%LOCALAPPDATA%\winlibs-gcc16\mingw64\bin`): `g++ -O3 -march=native -std=c++17 gsq_view.cpp -o gsq_view.exe -static`.
 
-The decode step itself is about 5 ms in both.
+Both read `GSQ2` and every `GSQ4` option: Beta blobs, adaptive shape precision, the symbol layer, boxes and the bucketed columns. Both match the Python decoder within 1 brightness level on every file tested. At other scales, box corners are rounded to whole pixels.
 
 ## GPU kernel in CUDA C++: `gsq_cuda/`
-- `splat.cu` holds the forward and hand-written backward pass. One thread block (32×8 threads) per blob walks the blob's patch, with no integer division per pixel.
-- It's built as `gsq_splat.dll` and called from Python through ctypes (`gsimg/cuda_splat.py`), so it needs no torch C++ extension and no ninja.
-- Build: `gsq_cuda\build.bat`. It uses portable MSVC 14.44 (`%LOCALAPPDATA%\msvc-portable\setup_x64.bat`) and CUDA 12.8 nvcc (`%LOCALAPPDATA%\cuda-12.8`), targeting sm_120 (RTX 5060).
-- `model.render` picks the CUDA kernel first, then Triton, then PyTorch. `GSQ_KERNEL=cuda|triton|torch` forces one.
 
-Step time (8k blobs, render + backward; difference vs PyTorch is about 1e-3 relative, i.e. float rounding):
+- `splat.cu` holds the forward and hand-written backward pass for Gaussian and Beta blobs, with one 32×8 thread block per blob. Its gradients match PyTorch within float rounding.
+- It's built as `gsq_splat.dll` with `gsq_cuda\build.bat` (portable MSVC 14.44 + CUDA 12.8, sm_120) and called through ctypes.
+- `model.render` picks CUDA, then Triton (Gaussian only), then PyTorch. `GSQ_KERNEL=…` forces one.
 
-| Kernel | ms per step |
-|---|---|
-| PyTorch | 27.1 |
-| Triton | 2.9 |
-| **CUDA C++** | **2.7** |
+## Speed (RTX 5060)
 
-A full encode takes 28 s with either GPU kernel. The rest is Python overhead per step, which CUDA graphs would be the next lever for.
-
-## Speed (8k blobs, 512×320)
 | Step | Before | Now |
 |---|---|---|
-| Fit + quantise + encode | about 225 s | **about 28 s** (Triton kernel, `gsimg/tri.py`) |
-| Decode | about 0.35 s (Python) | **5 ms** (C++) / 6 ms (Rust) |
+| One fitting step, 8k blobs | 27 ms (PyTorch) → 4.97 ms (CUDA kernel, Python loop) | **3.07 ms** (CUDA graph) |
+| Fit with boxes + symbols, 2000 steps | 27.6 s | **7.2 s** (CUDA graph) |
+| Decode a file | about 0.35 s (Python) | **5 ms** (C++) / 6 ms (Rust) |
 
-## What was tried and dropped
-- Per-blob patch radius (`model.CUT`): most blobs are long and need the full radius-20 patch, so grouping by size was 3× slower. It is off; `GSQ3` would mark files that use it.
-- Codebook index hopping (straight-through VQ): unstable, no gain.
-- Two-stage residual codebooks: cost more bytes than they gained.
-- Predicting blob values from neighbours: no entropy gain, because blob values are spatially independent.
+The graph timings above were measured while other jobs shared the GPU. Quantisation training (1600 steps) still runs eagerly, because it computes adaptive position precision on the CPU every step.
+
+## What was tried
+
+| Idea | Result |
+|---|---|
+| Beta kernel (sharpness per blob) | Text +1 to +6 dB at the same bytes; no change on other images. It needs k held fixed for the first 30% of fitting, or most blobs collapse to k < 1 and lose 7 dB. Kept as `--beta`. |
+| Learned blob shapes (`exp_shape.py`) | A shared learned profile, one learned 16×16 stamp, and 8 stamps with one picked per blob: none beat the Gaussian. Blending all 8 stamps per blob costs 8 numbers per blob, and twice as many Gaussians is better for that budget. Dropped. |
+| Finer base grid (1/510) | +0.1 to +2.7 dB at the same bytes. Kept. |
+| Adaptive shape precision | Up to 19.5% smaller and up to +0.9 dB. Kept. |
+| Mixed quantisation (rate from noise, picture from rounding) | Only 1–3% smaller. Off (`sq.MIXED`). |
+| Rate model check (`exp_rate.py`) | The Laplace model is within 2–5% of the real coder. The quality lost in quantisation is the rate/quality trade, not a mispriced rate. |
+| Symbol layer | Text 48–53 KB → about 9 KB at 44 dB. Kept. Fixed 1/16 px prototype and 1/8 px copy positions capped text at 41 dB; adaptive positions lifted that. |
+| Boxes | UI screen and chart files 2–3× smaller. Kept. |
+| Bucketed columns | 0–2.4% smaller. Kept. |
+| Colour context (Co, Cg coded given Y) | +1.3% to −2% of the file after model-learning cost. Dropped. |
+| Per-blob patch radius (`model.CUT`) | Most blobs need the full radius, and grouping was 3× slower. Off. |
+| Codebook index hopping, two-stage codebooks, neighbour prediction | No gain. Dropped. |

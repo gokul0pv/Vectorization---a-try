@@ -164,6 +164,8 @@ class GaussImage(torch.nn.Module):
         L = self.L()
         score = self.rgb.abs().sum(1) * L[:, 0] * L[:, 2]
         k = int(frac * score.numel())
+        if k == 0:
+            return
         weak = torch.topk(score, k, largest=False).indices
         self.xy[weak] = self._sample(err, k) + torch.rand(k, 2, device=err.device)
         self.rgb[weak] = 0
