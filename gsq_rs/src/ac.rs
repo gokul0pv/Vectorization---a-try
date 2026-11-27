@@ -132,6 +132,11 @@ impl<'a> Decoder<'a> {
         for _ in 0..n {
             let v = if mode == 0 {
                 self.sym(&mut m) as i64
+            } else if mode >= 2 {
+                // bucket + (mode - 2) raw low bits
+                let sh = (mode - 2) as u32;
+                let b = self.sym(&mut m) as i64;
+                (b << sh) | if sh > 0 { self.raw(sh) } else { 0 }
             } else {
                 let k = self.sym(&mut m) as u32;
                 match k {

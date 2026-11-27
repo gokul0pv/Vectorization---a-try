@@ -134,25 +134,59 @@ class Decoder:
 DIRECT_MAX = 512
 
 
+BUCKET_MAX = 4096
+
+
+def _put_mode(enc, u, mode, a):
+    """u = vals - lo (>= 0). mode 0: direct (a symbols); 1: bit length
+    (a = 64) + raw bits; 2 + s: bucket u >> s (a buckets) + s raw low bits."""
+    m = Model(a)
+    if mode == 0:
+        for v in u:
+            enc.sym(m, v)
+    elif mode == 1:
+        for v in u:
+            k = v.bit_length()
+            enc.sym(m, k)
+            if k > 1:
+                enc.raw(v & ((1 << (k - 1)) - 1), k - 1)
+    else:
+        sh = mode - 2
+        for v in u:
+            enc.sym(m, v >> sh)
+            enc.raw(v & ((1 << sh) - 1), sh)
+
+
 def put_ints(enc, vals):
-    """Codes an int array; returns the (mode, min, size) header it needs."""
+    """Codes an int array; returns the (mode, min, size) header it needs.
+    Large alphabets try several codings and keep the smallest (the adaptive
+    model learns a 400-symbol alphabet slowly; buckets of 8 learn faster)."""
     vals = np.asarray(vals, np.int64)
     if vals.size == 0:
         return (0, 0, 1)
     lo = int(vals.min())
     a = int(vals.max()) - lo + 1
-    if a <= DIRECT_MAX:
-        m = Model(a)
-        for v in (vals - lo).tolist():
-            enc.sym(m, v)
+    u = (vals - lo).tolist()
+    if a <= 64:
+        _put_mode(enc, u, 0, a)
         return (0, lo, a)
-    m = Model(64)
-    for v in (vals - lo).tolist():
-        k = v.bit_length()
-        enc.sym(m, k)
-        if k > 1:
-            enc.raw(v & ((1 << (k - 1)) - 1), k - 1)
-    return (1, lo, 64)
+    cands = [(1, 64)]
+    if a <= BUCKET_MAX:
+        cands.append((0, a))
+    for sh in range(1, 6):
+        nb = ((a - 1) >> sh) + 1
+        if nb <= BUCKET_MAX and nb >= 8:
+            cands.append((2 + sh, nb))
+    best = None
+    for mode, size in cands:
+        t = Encoder()
+        _put_mode(t, u, mode, size)
+        n = len(t.finish())
+        if best is None or n < best[0]:
+            best = (n, mode, size)
+    _, mode, size = best
+    _put_mode(enc, u, mode, size)
+    return (mode, lo, size)
 
 
 def get_ints(dec, n, head):
@@ -162,6 +196,12 @@ def get_ints(dec, n, head):
     if mode == 0:
         for i in range(n):
             out[i] = dec.sym(m) + lo
+        return out
+    if mode >= 2:
+        sh = mode - 2
+        for i in range(n):
+            b = dec.sym(m)
+            out[i] = ((b << sh) | dec.raw(sh)) + lo
         return out
     for i in range(n):
         k = dec.sym(m)

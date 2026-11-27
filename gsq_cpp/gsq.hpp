@@ -101,6 +101,11 @@ struct Decoder {
         for (auto& v : out) {
             int64_t x;
             if (h.mode == 0) x = int64_t(sym(m));
+            else if (h.mode >= 2) {   // bucket + (mode - 2) raw low bits
+                unsigned sh = unsigned(h.mode - 2);
+                int64_t b = int64_t(sym(m));
+                x = (b << sh) | (sh ? raw(sh) : 0);
+            }
             else {
                 unsigned k = unsigned(sym(m));
                 x = k == 0 ? 0 : k == 1 ? 1 : (int64_t(1) << (k - 1)) | raw(k - 1);
