@@ -1,5 +1,6 @@
 """Explain-it picture: original | our file | AVIF same size | the blobs.
-usage: python make_figure.py NAME N LAM  (needs out/NAME_N_sq_LAM.gsq from bench)"""
+usage: python make_figure.py NAME N LAM [SUFFIX]  (needs out/NAME_N_sq_LAM[SUFFIX].gsq from bench;
+       SUFFIX is _sym for files made with bench.py --symbols)"""
 import sys
 from pathlib import Path
 
@@ -11,8 +12,9 @@ from gsimg import sq
 from gsimg.codec import render_decoded
 
 name, N, lam = sys.argv[1], sys.argv[2], sys.argv[3]
+suffix = sys.argv[4] if len(sys.argv) > 4 else ""
 OUT = Path(__file__).parent / "out"
-stem = f"{name}_{N}_sq_{lam}"
+stem = f"{name}_{N}_sq_{lam}{suffix}"
 buf = (OUT / f"{stem}.gsq").read_bytes()
 orig = Image.open(OUT / f"{name}_orig.png").convert("RGB")
 ours = Image.open(OUT / f"{stem}_gs.png").convert("RGB")
@@ -41,6 +43,11 @@ for (x, y), (a, b, c), col in zip(xy, L, rgb):
     pts = (pts + np.array([[x], [y]])) * 2
     cc = tuple(int(v) for v in np.clip(np.abs(col) / max(np.abs(col).max(), 1e-3) * 255, 40, 255))
     bd.line(list(map(tuple, pts.T)) + [tuple(pts[:, 0])], fill=cc, width=1)
+n_boxes = 0
+if d.get("boxes") is not None:     # box layer: outlines in white
+    for x0, y0, x1, y1 in d["boxes"].cpu().numpy().tolist():
+        bd.rectangle((x0 * 2, y0 * 2, x1 * 2 - 1, y1 * 2 - 1), outline=(235, 235, 235), width=1)
+    n_boxes = len(d["boxes"])
 blob = blob.resize((W, H), Image.LANCZOS)
 
 # 2x render from the same file
@@ -53,7 +60,8 @@ tiles = [
     (orig, "Original", f"PNG {png_kb:.0f} KB (lossless)"),
     (ours, "Our blob file", f"{kb:.0f} KB  -  quality {psnr(ours):.1f} dB"),
     (avif, "AVIF, same size", f"{kb:.0f} KB  -  quality {psnr(avif):.1f} dB"),
-    (blob, f"The {len(xy)} blobs inside our file", "each = position + shape + colour"),
+    (blob, f"The {len(xy)} blobs" + (f" + {n_boxes} boxes" if n_boxes else "") + " in our file",
+     "repeated letters are ONE stored shape drawn many times" if suffix else "each = position + shape + colour"),
 ]
 # zoom crops (3x) of the most detailed area
 g = np.asarray(orig.convert("L"), np.float32)

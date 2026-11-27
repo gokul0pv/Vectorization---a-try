@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .model import GaussImage, render
+from .model import GaussImage, render, run_steps
 from .rects import find_rects, init_colours, render_rects
 
 
@@ -120,19 +120,18 @@ def fit_symbols(target, n_free, syms, iters=6000, lr=(0.05, 0.05, 0.02, 0.005), 
               {"params": [m.prgb], "lr": lr[2]}, {"params": [m.off], "lr": 0.005}]
     if m.has_boxes:
         groups.append({"params": [m.brgb], "lr": 0.002})
-    opt = torch.optim.Adam(groups)
-    lr0 = [g["lr"] for g in opt.param_groups]
-    for it in range(iters):
-        f = 0.5 * (1 + math.cos(math.pi * it / iters))
-        for g, l0 in zip(opt.param_groups, lr0):
-            g["lr"] = l0 * (0.05 + 0.95 * f)
-        img = m()
-        loss = F.mse_loss(img, target)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
+    lr0 = [g["lr"] for g in groups]
+    opt_ref = {}
+
+    def lr_at(it):
+        f = 0.05 + 0.95 * 0.5 * (1 + math.cos(math.pi * it / iters))
+        return [l0 * f for l0 in lr0]
+
+    def hook(it, img):
         if it and it % 250 == 0 and it < 0.7 * iters:
-            m.relocate(opt, ((img.detach() - target) ** 2).sum(-1), 0.03)
+            m.relocate(opt_ref["opt"], ((img - target) ** 2).sum(-1), 0.03)
+
+    run_steps(m, target, groups, iters, lr_at, hook, None, opt_ref)
     return m
 
 

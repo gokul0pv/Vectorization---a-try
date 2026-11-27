@@ -184,6 +184,70 @@ def psnr(a, b):
     return 10 * math.log10(1 / max(mse, 1e-12))
 
 
+GRAPHS = os.environ.get("GSQ_GRAPHS", "1") != "0"   # CUDA graphs for the fitting loop
+
+
+def run_steps(m, target, groups, iters, lr_at, hook=None, log=None, opt_ref=None):
+    """Adam on MSE for `iters` steps. lr_at(it) -> one lr per group;
+    hook(it, img) runs eagerly after a step (relocation). With the CUDA
+    kernel, one step (forward + backward + Adam) is captured once as a CUDA
+    graph and replayed: no Python or launch overhead per step."""
+    use_graph = GRAPHS and target.is_cuda and KERNEL == "cuda" and "cuda" in KERNELS
+    opt_ref = {} if opt_ref is None else opt_ref
+    if not use_graph:
+        opt = opt_ref["opt"] = torch.optim.Adam(groups, fused=True)
+        for it in range(iters):
+            for g, l in zip(opt.param_groups, lr_at(it)):
+                g["lr"] = l
+            img = m()
+            loss = F.mse_loss(img, target)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            if hook:
+                hook(it, img.detach())
+            if log and (it % 500 == 0 or it == iters - 1):
+                log(f"  it {it:5d}  psnr {psnr(img.detach(), target):.2f}")
+        return
+    dev = target.device
+    for g, l in zip(groups, lr_at(0)):
+        g["lr"] = torch.tensor(float(l), device=dev)
+    opt = opt_ref["opt"] = torch.optim.Adam(groups, fused=True, capturable=True)
+
+    def set_lr(it):
+        for g, l in zip(opt.param_groups, lr_at(it)):
+            g["lr"].fill_(l)
+
+    def step():
+        img = m()
+        F.mse_loss(img, target).backward()
+        opt.step()
+        return img.detach()               # nothing keeps the autograd graph alive
+
+    warm = min(3, iters)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for it in range(warm):
+            set_lr(it)
+            opt.zero_grad(set_to_none=True)
+            img = step()
+            if hook:
+                hook(it, img.detach())
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    opt.zero_grad(set_to_none=True)
+    with torch.cuda.graph(graph):
+        img = step()                      # recorded, not run
+    for it in range(warm, iters):
+        set_lr(it)
+        graph.replay()
+        if hook:
+            hook(it, img.detach())
+        if log and (it % 500 == 0 or it == iters - 1):
+            log(f"  it {it:5d}  psnr {psnr(img.detach(), target):.2f}")
+
+
 def fit(target, N, iters=6000, R=20, log=None, lr=(0.05, 0.05, 0.02, 0.005), reloc_every=250, reloc_frac=0.03, reloc_until=0.7, beta=False, klr=0.05, kfreeze=0.3):
     torch.manual_seed(0)
     m = GaussImage(target, N, R, beta)
@@ -195,21 +259,20 @@ def fit(target, N, iters=6000, R=20, log=None, lr=(0.05, 0.05, 0.02, 0.005), rel
     ]
     if beta:
         groups.append({"params": [m.kraw], "lr": klr})
-    opt = torch.optim.Adam(fused=True, params=groups)
-    lr0 = [g["lr"] for g in opt.param_groups]
-    for it in range(iters):
-        f = 0.5 * (1 + math.cos(math.pi * it / iters))
-        for g, l0 in zip(opt.param_groups, lr0):
-            g["lr"] = l0 * (0.05 + 0.95 * f)
+    lr0 = [g["lr"] for g in groups]
+
+    def lr_at(it):
+        f = 0.05 + 0.95 * 0.5 * (1 + math.cos(math.pi * it / iters))
+        out = [l0 * f for l0 in lr0]
         if beta and it < kfreeze * iters:   # let shapes settle before k moves
-            opt.param_groups[-1]["lr"] = 0.0
-        img = m()
-        loss = F.mse_loss(img, target)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
+            out[-1] = 0.0
+        return out
+
+    opt_ref = {}
+
+    def hook(it, img):
         if it and it % reloc_every == 0 and it < reloc_until * iters:
-            m.relocate(opt, ((img.detach() - target) ** 2).sum(-1), reloc_frac)
-        if log and (it % 500 == 0 or it == iters - 1):
-            log(f"  it {it:5d}  psnr {psnr(img.detach(), target):.2f}")
+            m.relocate(opt_ref["opt"], ((img - target) ** 2).sum(-1), reloc_frac)
+
+    run_steps(m, target, groups, iters, lr_at, hook, log, opt_ref)
     return m

@@ -11,3 +11,6 @@ gsq_cuda/*.dll
 gsq_cuda/*.lib
 gsq_cuda/*.exp
 *.pt
+
+# Kodak test set (download with get_kodak.sh; not ours to publish)
+kodak/

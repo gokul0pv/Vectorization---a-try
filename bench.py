@@ -2,7 +2,8 @@
 
 usage: python bench.py IMG [IMG ...] [--mode sq|vq] [--n 4000,8000] [--lam 0.02,0.05]
        [--size 512] [--iters 2000] [--tag run1]
-Baselines are fair: best of 4:2:0 and 4:4:4 colour (JPEG/AVIF), sharp YUV (WebP).
+Baselines are fair: best of 4:2:0 and 4:4:4 colour (JPEG/AVIF), sharp YUV (WebP),
+JPEG XL effort 7 (if pillow-jxl-plugin is installed; lossless size reported too).
 """
 import argparse
 import io
@@ -24,7 +25,13 @@ OUT = ROOT / "out"
 CACHE = OUT / "cache"
 BASE_OPTS = {"JPEG": [dict(subsampling=2), dict(subsampling=0)],
              "AVIF": [dict(subsampling="4:2:0"), dict(subsampling="4:4:4")],
-             "WEBP": [dict(method=6), dict(method=6, use_sharp_yuv=True)]}
+             "WEBP": [dict(method=6), dict(method=6, use_sharp_yuv=True)],
+             "JXL": [dict(effort=7)]}
+try:
+    import pillow_jxl  # noqa: F401  (registers JPEG XL with Pillow: pip install pillow-jxl-plugin)
+    FORMATS = ("JPEG", "WEBP", "AVIF", "JXL")
+except ImportError:
+    FORMATS = ("JPEG", "WEBP", "AVIF")
 
 
 def load(p, size):
@@ -54,7 +61,7 @@ def curve(im, fmt):
     ref = np.asarray(im, np.float64) / 255
     pts = []
     for o in BASE_OPTS[fmt]:
-        for q in list(range(5, 85, 3)) + list(range(85, 101)):
+        for q in list(range(5, 85, 3)) + list(range(85, 100 if fmt == "JXL" else 101)):   # JXL q100 = use lossless
             b = io.BytesIO()
             im.save(b, fmt, quality=q, **o)
             d = np.asarray(Image.open(io.BytesIO(b.getvalue())).convert("RGB"), np.float64) / 255
@@ -119,7 +126,12 @@ def main():
         im.save(OUT / f"{name}_orig.png")
         tgt = to_t(im)
         png = (OUT / f"{name}_orig.png").stat().st_size
-        curves = {f: curve(im, f) for f in ("JPEG", "WEBP", "AVIF")}
+        curves = {f: curve(im, f) for f in FORMATS}
+        lossless = {}
+        if "JXL" in FORMATS:
+            b = io.BytesIO()
+            im.save(b, "JXL", lossless=True, effort=7)
+            lossless["jxl_lossless_bytes"] = b.tell()
         lams = [float(x) for x in a.lam.split(",")] if a.mode == "sq" else [None]
         for N in map(int, a.n.split(",")):
             m = cached_fit(name, tgt, N, a.iters, a.beta, np.asarray(im) if a.symbols else None)
@@ -148,7 +160,7 @@ def main():
                 row = dict(image=name, N=N, beta=a.beta, symbols=a.symbols, kept=int(d["xy"].shape[0]), mode=a.mode, lam=lam,
                            bytes=len(buf), bpp=round(8 * len(buf) / (im.width * im.height), 3),
                            psnr_float=round(raw, 2), psnr_file=round(p, 2), png_bytes=png,
-                           enc_s=round(t_enc, 1), dec_s=round(t_dec, 2))
+                           enc_s=round(t_enc, 1), dec_s=round(t_dec, 2), **lossless)
                 for f, pts in curves.items():
                     r = at_size(pts, len(buf))
                     row[f.lower()] = round(r[1], 2) if r else None
