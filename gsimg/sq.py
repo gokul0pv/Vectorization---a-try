@@ -19,12 +19,17 @@ from .codec import feat_to_L, shape_feat
 from .model import CUT, KMAX, KMIN, base_shape, psnr, render
 
 # GSQ2: 6 channels, base step 1/127.5.  (GSQ3 = per-blob patch radius rule; off, see model.CUT)
-# GSQ4: + flags byte after the header (bit 0: Beta blobs, 7th channel log k),
+# GSQ4: + flags byte after the header (bit 0: Beta blobs, 7th channel log k;
+#       bit 1: adaptive shape precision, followed by float32 aref + uint8 G),
 #       base step 1/510 (the 7-bit base cost up to 2.7 dB on flat screenshots).
+#       With bit 1 the colour channels are coded first, then each shape
+#       channel split by precision group g = -G..G (own model per group).
 MAGIC_OLD, MAGIC = b"GSQ2", b"GSQ4"
 BASE_SCALE = {MAGIC_OLD: 127.5, MAGIC: 510.0}
 BASE_S = BASE_SCALE[MAGIC]
 K_STEP0 = 0.1
+SHAPE_AREF = 0.05  # adaptive shape precision (None = off): shape step * 2^-g, see shape_g
+SHAPE_G = 2
 MIXED = False    # stage A: rate from noisy values, picture from rounded (STE)
 BAND = 8
 EMAX = 7          # finest position step 1/128 px
@@ -43,6 +48,17 @@ def pos_exp(sym, steps, k):
     h = (s11 + s22) / 2
     smin = np.sqrt(np.maximum(h - np.sqrt(np.maximum(h * h - (a * c) ** 2, 0)), 1e-12))
     return np.clip(np.round(-np.log2(np.clip(k * smin / amp, 2.0 ** -EMAX, 1.0))), 0, EMAX).astype(np.int64)
+
+
+def shape_g(csym, csteps, aref, G):
+    """Shape precision group per blob from the QUANTISED colour (float64, so
+    the C++/Rust decoders get the same integers): strong blobs (large colour
+    amplitude) get a finer shape step, faint ones a coarser one.
+    g = clip(round_half_even(log2(amp / aref)), -G, G); shape step * 2^-g."""
+    v = csym.astype(np.float64) * csteps.astype(np.float64)
+    y, co, cg = v[:, 0], v[:, 1], v[:, 2]
+    amp = np.maximum(np.abs(np.stack([y + co - cg, y + cg, y - co - cg], 1)).max(1), 1e-4)
+    return np.clip(np.round(np.log2(amp / np.float64(aref))), -G, G).astype(np.int64)
 
 
 def rgb2ycc(c):
@@ -85,12 +101,29 @@ class SQ(torch.nn.Module):
         self.logb = P((y - mu).abs().mean(0).clamp_min(0.3).log())
         self.base = P(m.base.detach().clone())
         self.hard = False
+        self.aref = None if SHAPE_AREF is None else float(np.float32(SHAPE_AREF))
+        self.G = SHAPE_G
+
+    def blob_scale(self):
+        """Per-blob step multiplier (N, C): 1 for colour and k; for the shape
+        channels 2^-g from the QUANTISED colour, so the decoder knows it
+        before it reads the shape (colour is coded first)."""
+        m = torch.ones_like(self.lat)
+        if self.aref is None:
+            return m
+        with torch.no_grad():
+            st = self.logstep.exp().detach().float().cpu().numpy()
+            csym = torch.round(self.lat[:, 3:6] / torch.as_tensor(st[3:6], device=self.lat.device)).cpu().numpy()
+            g = shape_g(csym, st[3:6], self.aref, self.G)
+            m[:, :3] = torch.as_tensor(2.0 ** -g, dtype=m.dtype, device=m.device)[:, None]
+        return m
 
     def symbols(self):
-        return torch.round(self.lat / self.logstep.exp())
+        return torch.round(self.lat / (self.logstep.exp() * self.blob_scale()))
 
     def parts(self):
-        step = self.logstep.exp()
+        sc_b = self.blob_scale()
+        step = self.logstep.exp() * sc_b
         y = self.lat / step
         if self.hard:
             yq = _ste(y, torch.round(y))
@@ -99,10 +132,11 @@ class SQ(torch.nn.Module):
             yq = y + torch.rand_like(y) - 0.5
             v = (_ste(y, torch.round(y)) if MIXED else yq) * step
         b = self.logb.exp()
-        p = _lap_cdf(yq + 0.5, self.mu, b) - _lap_cdf(yq - 0.5, self.mu, b)
+        mu, b = self.mu / sc_b, b / sc_b    # same spread in value units
+        p = _lap_cdf(yq + 0.5, mu, b) - _lap_cdf(yq - 0.5, mu, b)
         bits = -torch.log2(p.clamp_min(1e-9)).sum()
         with torch.no_grad():
-            e = pos_exp(torch.round(y).cpu().numpy(), step.detach().cpu().numpy(), self.k)
+            e = pos_exp((torch.round(y) * sc_b).cpu().numpy(), self.logstep.exp().detach().cpu().numpy(), self.k)
             sc = torch.as_tensor(2.0 ** e, dtype=self.xy.dtype, device=self.xy.device)[:, None]
         xy = _ste(self.xy, torch.round(self.xy * sc) / sc)
         base = _ste(self.base, torch.round((self.base.clamp(-0.5, 1.5) + 0.5) * BASE_S) / BASE_S - 0.5)
@@ -182,7 +216,8 @@ def encode(q):
         N, R, W, H = q.xy.shape[0], q.R, q.W, q.H
         steps = q.logstep.exp().float().cpu().numpy()
         sym = q.symbols().long().cpu().numpy()
-        e = pos_exp(sym, steps, q.k)
+        mult = q.blob_scale().cpu().numpy().astype(np.float64)
+        e = pos_exp(sym * mult, steps, q.k)
         u = np.round((q.xy.double().cpu().numpy() + R) * (2.0 ** e)[:, None]).astype(np.int64)
         u = np.maximum(u, 0)
         u[:, 0] = np.minimum(u[:, 0], ((W + 2 * R) << e) - 1)
@@ -193,6 +228,7 @@ def encode(q):
         band, yin = cy // BAND, cy % BAND
         order = np.lexsort((cx, band))
         cx, band, yin, sym, e, frac = cx[order], band[order], yin[order], sym[order], e[order], frac[order]
+        adaptive = q.aref is not None
         nb = (H + 2 * R) // BAND + 1
         counts = np.bincount(band, minlength=nb)
         starts = np.r_[0, np.cumsum(counts)[:-1]]
@@ -201,13 +237,22 @@ def encode(q):
         dx[starts[counts > 0]] = cx[starts[counts > 0]]
         base = np.round((q.base.clamp(-0.5, 1.5).cpu().numpy() + 0.5) * BASE_S).astype(np.int64).reshape(-1)
         enc = ac.Encoder()
-        heads = [ac.put_ints(enc, s) for s in
-                 [base, counts, dx, yin] + [sym[:, j] for j in range(sym.shape[1])]]
+        if adaptive:
+            g = shape_g(sym[:, 3:6], steps[3:6], q.aref, q.G)
+            cols = [sym[:, j] for j in (3, 4, 5)]
+            cols += [sym[g == v, j] for j in (0, 1, 2) for v in range(-q.G, q.G + 1)]
+            cols += [sym[:, j] for j in range(6, sym.shape[1])]
+        else:
+            cols = [sym[:, j] for j in range(sym.shape[1])]
+        heads = [ac.put_ints(enc, s) for s in [base, counts, dx, yin] + cols]
         for (fx, fy), ei in zip(frac.tolist(), e.tolist()):
             enc.raw(fx, ei)
             enc.raw(fy, ei)
         body = enc.finish()
-        head = MAGIC + struct.pack("<HHBIfB", H, W, R, N, q.k, int(q.beta)) + steps.astype(np.float32).tobytes()
+        head = MAGIC + struct.pack("<HHBIfB", H, W, R, N, q.k, int(q.beta) | (2 if adaptive else 0))
+        if adaptive:
+            head += struct.pack("<fB", q.aref, q.G)
+        head += steps.astype(np.float32).tobytes()
         head += b"".join(struct.pack("<Bih", m, lo, a) for m, lo, a in heads)
         return head + body
 
@@ -215,17 +260,21 @@ def encode(q):
 def decode(buf, device="cuda"):
     mg = bytes(buf[:4])
     assert mg in BASE_SCALE, mg
-    cut, beta = 0.0, False
+    cut, beta, aref, G = 0.0, False, None, 0
     H, W, R, N, k = struct.unpack("<HHBIf", buf[4:17])
     o = 17
     if mg == MAGIC:
-        beta = bool(buf[o] & 1)
+        beta, adaptive = bool(buf[o] & 1), bool(buf[o] & 2)
         o += 1
+        if adaptive:
+            aref, G = struct.unpack("<fB", buf[o:o + 5])
+            o += 5
     nch = 7 if beta else 6
+    ncols = nch if aref is None else nch + 3 * 2 * G
     steps = np.frombuffer(buf[o:o + 4 * nch], np.float32)
     o += 4 * nch
     heads = []
-    for _ in range(4 + nch):
+    for _ in range(4 + ncols):
         heads.append(struct.unpack("<Bih", buf[o:o + 7]))
         o += 7
     dec = ac.Decoder(buf[o:])
@@ -235,8 +284,25 @@ def decode(buf, device="cuda"):
     counts = ac.get_ints(dec, nb, heads[1])
     dx = ac.get_ints(dec, N, heads[2])
     yin = ac.get_ints(dec, N, heads[3])
-    sym = np.stack([ac.get_ints(dec, N, heads[4 + j]) for j in range(nch)], 1)
-    e = pos_exp(sym, steps, np.float32(k))
+    mult = np.ones(N)
+    if aref is None:
+        sym = np.stack([ac.get_ints(dec, N, heads[4 + j]) for j in range(nch)], 1)
+    else:
+        sym = np.zeros((N, nch), np.int64)
+        hi = 4
+        for j in (3, 4, 5):
+            sym[:, j] = ac.get_ints(dec, N, heads[hi]); hi += 1
+        g = shape_g(sym[:, 3:6], steps[3:6], aref, G)
+        for j in (0, 1, 2):
+            for v in range(-G, G + 1):
+                sel = g == v
+                sym[sel, j] = ac.get_ints(dec, int(sel.sum()), heads[hi]); hi += 1
+        for j in range(6, nch):
+            sym[:, j] = ac.get_ints(dec, N, heads[hi]); hi += 1
+        mult = 2.0 ** -g
+    symv = sym.astype(np.float64)
+    symv[:, :3] *= mult[:, None]
+    e = pos_exp(symv, steps, np.float32(k))
     frac = np.array([(dec.raw(ei), dec.raw(ei)) for ei in e.tolist()], np.int64).reshape(N, 2)
     band = np.repeat(np.arange(nb), counts)
     starts = np.r_[0, np.cumsum(counts)[:-1]]
@@ -247,7 +313,7 @@ def decode(buf, device="cuda"):
     u = (np.stack([cx, cy], 1) << e[:, None]) + frac
     xy = (u / (2.0 ** e)[:, None] - R).astype(np.float32)
     t = lambda a: torch.as_tensor(a, device=device)
-    v = t(sym.astype(np.float32)) * t(steps.copy())
+    v = t(symv.astype(np.float32)) * t(steps.copy())
     base = t(base.reshape(1, 3, bh, bw).astype(np.float32) / BASE_SCALE[mg] - 0.5)
     kb = v[:, 6].exp().clamp(KMIN, KMAX) if beta else None
     return dict(xy=t(xy), L=feat_to_L(v[:, :3]), rgb=ycc2rgb(v[:, 3:6]), base=base, H=H, W=W, R=R, cut=cut, k=kb)

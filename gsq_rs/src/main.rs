@@ -10,7 +10,8 @@ use rayon::prelude::*;
 use std::time::Instant;
 
 const MAGIC: &[u8; 4] = b"GSQ3"; // GSQ3: per-blob patch radius min(R, ceil(CUT*sigma_max))
-const MAGIC4: &[u8; 4] = b"GSQ4"; // GSQ4: flags byte (bit 0 Beta, 7th channel log k), base step 1/510
+const MAGIC4: &[u8; 4] = b"GSQ4"; // GSQ4: flags byte (bit 0 Beta, 7th channel log k;
+                                  // bit 1 adaptive shape precision + f32 aref + u8 G), base step 1/510
 const KMIN: f32 = 0.25;
 const KMAX: f32 = 12.0;
 const CUT: f32 = 4.0;
@@ -36,8 +37,8 @@ fn rd<const N: usize>(b: &[u8], o: usize) -> [u8; N] {
 }
 
 /// Per-blob position precision exponent (same formula as sq.pos_exp, f64).
-fn pos_exp(sym: &[i64], steps: &[f32], k: f64) -> u32 {
-    let v: Vec<f64> = (0..6).map(|j| sym[j] as f64 * steps[j] as f64).collect();
+fn pos_exp(sym: &[i64], steps: &[f32], k: f64, mult: f64) -> u32 {
+    let v: Vec<f64> = (0..6).map(|j| sym[j] as f64 * steps[j] as f64 * if j < 3 { mult } else { 1.0 }).collect();
     let (a, b, c) = (v[0].exp(), v[1], v[2].exp());
     let (y, co, cg) = (v[3], v[4], v[5]);
     let amp = [y + co - cg, y + cg, y - co - cg].iter().fold(0f64, |m, x| m.max(x.abs())).max(1e-3);
@@ -46,6 +47,13 @@ fn pos_exp(sym: &[i64], steps: &[f32], k: f64) -> u32 {
     let smin = (h - (h * h - (a * c) * (a * c)).max(0.0).sqrt()).max(1e-12).sqrt();
     let r = (k * smin / amp).clamp(2f64.powf(-EMAX), 1.0);
     (-r.log2()).round_ties_even().clamp(0.0, EMAX) as u32
+}
+
+/// Shape precision group from the quantised colour (same as sq.shape_g, f64).
+fn shape_g(cs: &[i64], st: &[f32], aref: f64, g: i64) -> i64 {
+    let (y, co, cg) = (cs[0] as f64 * st[0] as f64, cs[1] as f64 * st[1] as f64, cs[2] as f64 * st[2] as f64);
+    let amp = [y + co - cg, y + cg, y - co - cg].iter().fold(1e-4f64, |m, x| m.max(x.abs()));
+    ((amp / aref).log2().round_ties_even() as i64).clamp(-g, g)
 }
 
 pub fn decode(buf: &[u8]) -> Result<Blobs, String> {
@@ -60,19 +68,31 @@ pub fn decode(buf: &[u8]) -> Result<Blobs, String> {
     let n = u32::from_le_bytes(rd(buf, 9)) as usize;
     let k = f32::from_le_bytes(rd(buf, 13)) as f64;
     let mut o = 17;
-    let beta = v4 && buf[o] & 1 == 1;
+    let flags = if v4 { buf[o] } else { 0 };
     if v4 {
         o += 1;
     }
+    let beta = flags & 1 == 1;
+    let adaptive = flags & 2 == 2;
+    let (mut aref, mut gmax) = (0f64, 0i64);
+    if adaptive {
+        if buf.len() < o + 5 {
+            return Err("truncated header".into());
+        }
+        aref = f32::from_le_bytes(rd(buf, o)) as f64;
+        gmax = buf[o + 4] as i64;
+        o += 5;
+    }
     let nch = if beta { 7 } else { 6 };
-    let hdr = o + 4 * nch + 7 * (4 + nch);
+    let ncols = nch + if adaptive { 6 * gmax as usize } else { 0 };
+    let hdr = o + 4 * nch + 7 * (4 + ncols);
     if buf.len() < hdr {
         return Err("truncated header".into());
     }
     let steps: Vec<f32> = (0..nch).map(|j| f32::from_le_bytes(rd(buf, o + 4 * j))).collect();
     o += 4 * nch;
     let mut heads = Vec::new();
-    for i in 0..4 + nch {
+    for i in 0..4 + ncols {
         let p = o + 7 * i;
         heads.push((buf[p], i32::from_le_bytes(rd(buf, p + 1)), i16::from_le_bytes(rd(buf, p + 5))));
     }
@@ -84,9 +104,48 @@ pub fn decode(buf: &[u8]) -> Result<Blobs, String> {
     let counts = d.ints(nb, heads[1]);
     let dx = d.ints(n, heads[2]);
     let yin = d.ints(n, heads[3]);
-    let cols: Vec<Vec<i64>> = (0..nch).map(|j| d.ints(n, heads[4 + j])).collect();
-    let sym: Vec<Vec<i64>> = (0..n).map(|i| (0..nch).map(|j| cols[j][i]).collect()).collect();
-    let e: Vec<u32> = sym.iter().map(|s| pos_exp(s, &steps, k)).collect();
+    let mut sym = vec![vec![0i64; nch]; n];
+    let mut mult = vec![1f64; n];
+    let mut hi = 4;
+    if !adaptive {
+        for j in 0..nch {
+            let col = d.ints(n, heads[hi]);
+            hi += 1;
+            for i in 0..n {
+                sym[i][j] = col[i];
+            }
+        }
+    } else {
+        for j in 3..6 {
+            let col = d.ints(n, heads[hi]);
+            hi += 1;
+            for i in 0..n {
+                sym[i][j] = col[i];
+            }
+        }
+        let g: Vec<i64> = sym.iter().map(|s| shape_g(&s[3..6], &steps[3..6], aref, gmax)).collect();
+        for i in 0..n {
+            mult[i] = 2f64.powi(-g[i] as i32);
+        }
+        for j in 0..3 {
+            for v in -gmax..=gmax {
+                let idx: Vec<usize> = (0..n).filter(|&i| g[i] == v).collect();
+                let col = d.ints(idx.len(), heads[hi]);
+                hi += 1;
+                for (c, &i) in idx.iter().enumerate() {
+                    sym[i][j] = col[c];
+                }
+            }
+        }
+        for j in 6..nch {
+            let col = d.ints(n, heads[hi]);
+            hi += 1;
+            for i in 0..n {
+                sym[i][j] = col[i];
+            }
+        }
+    }
+    let e: Vec<u32> = sym.iter().zip(&mult).map(|(s, &m)| pos_exp(s, &steps, k, m)).collect();
     let frac: Vec<(i64, i64)> = e.iter().map(|&ei| (d.raw(ei), d.raw(ei))).collect();
 
     let mut xy = Vec::with_capacity(n);
@@ -109,8 +168,8 @@ pub fn decode(buf: &[u8]) -> Result<Blobs, String> {
     let mut l = Vec::with_capacity(n);
     let mut rgb = Vec::with_capacity(n);
     let mut kb = Vec::new();
-    for s in &sym {
-        let v: Vec<f32> = (0..nch).map(|j| s[j] as f32 * steps[j]).collect();
+    for (s, &m) in sym.iter().zip(&mult) {
+        let v: Vec<f32> = (0..nch).map(|j| (s[j] as f64 * if j < 3 { m } else { 1.0 }) as f32 * steps[j]).collect();
         if beta {
             kb.push(v[6].exp().clamp(KMIN, KMAX));
         }
