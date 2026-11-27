@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from . import ac
 from .codec import feat_to_L, shape_feat
 from .model import CUT, KMAX, KMIN, base_shape, psnr, render
+from .rects import render_rects
 
 # GSQ2: 6 channels, base step 1/127.5.  (GSQ3 = per-blob patch radius rule; off, see model.CUT)
 # GSQ4: + flags byte after the header (bit 0: Beta blobs, 7th channel log k;
@@ -30,6 +31,9 @@ from .model import CUT, KMAX, KMIN, base_shape, psnr, render
 #       whole px + pos_exp fraction bits) and C copies (prototype id +
 #       position at 2^-copy_e px, sorted in reading order).
 #       Fixed 1/16 px prototype + 1/8 px copy positions capped text at 41 dB.
+#       bit 3: boxes (gsimg/rects.py), followed by uint32 B: pixel-aligned
+#       boxes that add a colour (step 1/BOX_S), coded in reading order
+#       (row delta, x0, width, height, r, g, b).
 MAGIC_OLD, MAGIC = b"GSQ2", b"GSQ4"
 BASE_SCALE = {MAGIC_OLD: 127.5, MAGIC: 510.0}
 BASE_S = BASE_SCALE[MAGIC]
@@ -38,6 +42,7 @@ SHAPE_AREF = 0.05  # adaptive shape precision (None = off): shape step * 2^-g, s
 SHAPE_G = 2
 MIXED = False    # stage A: rate from noisy values, picture from rounded (STE)
 BAND = 8
+BOX_S = 510.0     # box colour step (like the base grid)
 COPY_E = 6        # copy positions: 2^-6 = 1/64 px
 EMAX = 7          # finest position step 1/128 px
 K_POS = 0.006     # position step ~ K_POS * sigma_min / colour amplitude
@@ -96,6 +101,10 @@ class SQ(torch.nn.Module):
         self.sym = hasattr(m, "pxy")
         assert not (self.sym and self.beta), "symbol layer is Gaussian-only for now"
         self.nf = m.xy.shape[0]
+        self.has_boxes = bool(getattr(m, "has_boxes", False))
+        if self.has_boxes:
+            self.boxes = m.boxes.clone()
+            self.brgb = P(m.brgb.detach().clone())
         L, rgb = m.L(), m.rgb
         if self.sym:
             L, rgb = torch.cat([L, m.proto_L()]), torch.cat([rgb, m.prgb])
@@ -173,9 +182,15 @@ class SQ(torch.nn.Module):
             L, rgb = torch.cat([L[:nf], L[bo]]), torch.cat([rgb[:nf], rgb[bo]])
         return xy, L, rgb, base, bits, k
 
+    def box_rgb(self):
+        return _ste(self.brgb, torch.round(self.brgb * BOX_S) / BOX_S)
+
     def forward(self):
         xy, L, rgb, base, bits, k = self.parts()
-        return render(xy, L, rgb, base, self.H, self.W, self.R, k=k), bits
+        img = render(xy, L, rgb, base, self.H, self.W, self.R, k=k)
+        if self.has_boxes:
+            img = img + render_rects(self.boxes, self.box_rgb(), self.H, self.W)
+        return img, bits
 
     @torch.no_grad()
     def prune(self):
@@ -220,7 +235,8 @@ def _run(q, target, lam, iters, groups, log, tag):
 
 
 def _sym_groups(q, lr):
-    return [{"params": [q.pxy], "lr": lr}, {"params": [q.off], "lr": lr / 2}] if q.sym else []
+    g = [{"params": [q.pxy], "lr": lr}, {"params": [q.off], "lr": lr / 2}] if q.sym else []
+    return g + ([{"params": [q.brgb], "lr": lr / 5}] if q.has_boxes else [])
 
 
 def train(m, target, lam=0.2, iters_a=1000, iters_b=600, k=K_POS, log=None):
@@ -297,6 +313,13 @@ def _copy_cols(proto, oq):
     return [proto, dy, dx]
 
 
+def _box_cols(boxes, bq):
+    order = np.lexsort((boxes[:, 0], boxes[:, 1]))
+    b, c = boxes[order], bq[order]
+    dy = np.diff(b[:, 1], prepend=0)
+    return [dy, b[:, 0], b[:, 2] - b[:, 0], b[:, 3] - b[:, 1], c[:, 0], c[:, 1], c[:, 2]]
+
+
 def encode(q):
     with torch.no_grad():
         N, R, W, H = q.nf, q.R, q.W, q.H
@@ -330,7 +353,7 @@ def encode(q):
         for (fx, fy), ei in zip(frac.tolist(), e.tolist()):
             enc.raw(fx, ei)
             enc.raw(fy, ei)
-        flags = int(q.beta) | (2 if adaptive else 0) | (4 if q.sym else 0)
+        flags = int(q.beta) | (2 if adaptive else 0) | (4 if q.sym else 0) | (8 if q.has_boxes else 0)
         extra = b""
         if q.sym:
             P = q.n_protos
@@ -351,6 +374,11 @@ def encode(q):
                 enc.raw(fx, ei)
                 enc.raw(fy, ei)
             extra = struct.pack("<HIB", P, len(cp), COPY_E)
+        if q.has_boxes:
+            bx = q.boxes.cpu().numpy()
+            bq = np.round(q.brgb.double().cpu().numpy() * BOX_S).astype(np.int64)
+            heads += [ac.put_ints(enc, c) for c in _box_cols(bx, bq)]
+            extra += struct.pack("<I", len(bx))
         body = enc.finish()
         head = MAGIC + struct.pack("<HHBIfB", H, W, R, N, q.k, flags)
         if adaptive:
@@ -363,12 +391,12 @@ def encode(q):
 def decode(buf, device="cuda"):
     mg = bytes(buf[:4])
     assert mg in BASE_SCALE, mg
-    cut, beta, symb, aref, G = 0.0, False, False, None, 0
+    cut, beta, symb, hasb, aref, G = 0.0, False, False, False, None, 0
     H, W, R, N, k = struct.unpack("<HHBIf", buf[4:17])
     o = 17
     if mg == MAGIC:
         fl = buf[o]
-        beta, symb = bool(fl & 1), bool(fl & 4)
+        beta, symb, hasb = bool(fl & 1), bool(fl & 4), bool(fl & 8)
         o += 1
         if fl & 2:
             aref, G = struct.unpack("<fB", buf[o:o + 5])
@@ -377,9 +405,13 @@ def decode(buf, device="cuda"):
     if symb:
         P, C, copy_e = struct.unpack("<HIB", buf[o:o + 7])
         o += 7
+    NB = 0
+    if hasb:
+        NB, = struct.unpack("<I", buf[o:o + 4])
+        o += 4
     nch = 7 if beta else 6
     na = _n_attr_cols(nch, aref, G)
-    nheads = 4 + na + ((1 + na + 2 + 3) if symb else 0)
+    nheads = 4 + na + ((1 + na + 2 + 3) if symb else 0) + (7 if hasb else 0)
     steps = np.frombuffer(buf[o:o + 4 * nch], np.float32)
     o += 4 * nch
     heads = []
@@ -433,7 +465,15 @@ def decode(buf, device="cuda"):
         xy = np.concatenate([xy, (pxy[idx] + cxy[rep]).astype(np.float32)])
         symv = np.concatenate([symv, pv[idx]])
     t = lambda a: torch.as_tensor(a, device=device)
+    boxes = brgb = None
+    if hasb:
+        dyb, x0, bw_, bh_, cr, cg_, cb = (ac.get_ints(dec, NB, heads[hi + j]) for j in range(7))
+        hi += 7
+        y0 = np.cumsum(dyb)
+        boxes = t(np.stack([x0, y0, x0 + bw_, y0 + bh_], 1))
+        brgb = t((np.stack([cr, cg_, cb], 1) / BOX_S).astype(np.float32))
     v = t(symv.astype(np.float32)) * t(steps.copy())
     base = t(base.reshape(1, 3, bh, bw).astype(np.float32) / BASE_SCALE[mg] - 0.5)
     kb = v[:, 6].exp().clamp(KMIN, KMAX) if beta else None
-    return dict(xy=t(xy), L=feat_to_L(v[:, :3]), rgb=ycc2rgb(v[:, 3:6]), base=base, H=H, W=W, R=R, cut=cut, k=kb)
+    return dict(xy=t(xy), L=feat_to_L(v[:, :3]), rgb=ycc2rgb(v[:, 3:6]), base=base, H=H, W=W, R=R, cut=cut, k=kb,
+                boxes=boxes, brgb=brgb)

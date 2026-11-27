@@ -1,4 +1,6 @@
-"""Symbol layer: shapes that repeat (letters, icons) are drawn by ONE
+"""Layered picture: base grid + boxes (gsimg/rects.py) + symbol layer + free blobs.
+
+Symbol layer: shapes that repeat (letters, icons) are drawn by ONE
 prototype group of blobs, stored once; every copy is (prototype, position).
 Free blobs draw the rest. All are trained together, so each prototype
 learns from every copy of itself. Positions of copies are continuous
@@ -12,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from .model import GaussImage, render
+from .rects import find_rects, init_colours, render_rects
 
 
 def find_symbols(a, thr=24, tol=6.0, max_side=60):
@@ -46,9 +49,14 @@ def find_symbols(a, thr=24, tol=6.0, max_side=60):
 
 
 class SymbolImage(GaussImage):
-    def __init__(self, target, n_free, syms, R=20, per_px=0.5, mmin=3, mmax=40):
+    def __init__(self, target, n_free, syms, R=20, per_px=0.5, mmin=3, mmax=40, boxes=None):
         super().__init__(target, n_free, R)
         dev = target.device
+        self.has_boxes = boxes is not None and len(boxes) > 0
+        if self.has_boxes:
+            self.boxes = torch.as_tensor(np.asarray(boxes), dtype=torch.long, device=dev)
+            under = F.interpolate(self.base, size=(self.H, self.W), mode="bicubic", align_corners=False)[0].permute(1, 2, 0)
+            self.brgb = torch.nn.Parameter(init_colours(np.asarray(boxes), target - under.detach()))
         pxy, pcol, owner = [], [], []
         g = torch.Generator().manual_seed(0)
         for k, s in enumerate(syms):
@@ -59,8 +67,10 @@ class SymbolImage(GaussImage):
             pxy.append(np.stack([xs[idx], ys[idx]], 1) + 0.5)
             pcol.append(s["delta"][ys[idx], xs[idx]] * 0.6)
             owner += [k] * M
-        self.pxy = torch.nn.Parameter(torch.tensor(np.concatenate(pxy), dtype=torch.float32, device=dev))
-        self.prgb = torch.nn.Parameter(torch.tensor(np.concatenate(pcol), dtype=torch.float32, device=dev))
+        pxy = np.concatenate(pxy) if pxy else np.zeros((0, 2))
+        pcol = np.concatenate(pcol) if pcol else np.zeros((0, 3))
+        self.pxy = torch.nn.Parameter(torch.tensor(pxy, dtype=torch.float32, device=dev))
+        self.prgb = torch.nn.Parameter(torch.tensor(pcol, dtype=torch.float32, device=dev))
         Mt = self.pxy.shape[0]
         s0 = 0.45
         t = (s0 - 0.35) / (self.smax - 0.35)
@@ -75,11 +85,11 @@ class SymbolImage(GaussImage):
                 oo.append((x, y))
                 ci += [len(oo) - 1] * len(blobs)
                 bi.append(blobs)
-        self.off = torch.nn.Parameter(torch.tensor(oo, dtype=torch.float32, device=dev))
-        self.copy_of = torch.tensor(ci, device=dev)
-        self.blob_of = torch.cat(bi)
+        self.off = torch.nn.Parameter(torch.tensor(oo, dtype=torch.float32, device=dev).reshape(-1, 2))
+        self.copy_of = torch.tensor(ci, dtype=torch.long, device=dev)
+        self.blob_of = torch.cat(bi) if bi else torch.zeros(0, dtype=torch.long, device=dev)
         self.owner = owner                       # prototype of each prototype blob
-        self.copy_proto = torch.tensor([k for k, s in enumerate(syms) for _ in s["origins"]], device=dev)
+        self.copy_proto = torch.tensor([k for k, s in enumerate(syms) for _ in s["origins"]], dtype=torch.long, device=dev)
         self.n_protos = len(syms)
         self.n_proto_blobs, self.n_copies = Mt, len(oo)
 
@@ -95,16 +105,21 @@ class SymbolImage(GaussImage):
         xy = torch.cat([self.xy, self.pxy[self.blob_of] + self.off[self.copy_of]])
         L = torch.cat([self.L(), pL[self.blob_of]])
         rgb = torch.cat([self.rgb, self.prgb[self.blob_of]])
-        return render(xy, L, rgb, self.base, self.H, self.W, self.R)
+        img = render(xy, L, rgb, self.base, self.H, self.W, self.R)
+        if self.has_boxes:
+            img = img + render_rects(self.boxes, self.brgb, self.H, self.W)
+        return img
 
 
-def fit_symbols(target, n_free, syms, iters=6000, lr=(0.05, 0.05, 0.02, 0.005)):
+def fit_symbols(target, n_free, syms, iters=6000, lr=(0.05, 0.05, 0.02, 0.005), boxes=None):
     torch.manual_seed(0)
-    m = SymbolImage(target, n_free, syms)
+    m = SymbolImage(target, n_free, syms, boxes=boxes)
     groups = [{"params": [m.xy], "lr": lr[0]}, {"params": [m.sraw], "lr": lr[1]},
               {"params": [m.rgb], "lr": lr[2]}, {"params": [m.base], "lr": lr[3]},
               {"params": [m.pxy], "lr": 0.02}, {"params": [m.psraw], "lr": lr[1]},
               {"params": [m.prgb], "lr": lr[2]}, {"params": [m.off], "lr": 0.005}]
+    if m.has_boxes:
+        groups.append({"params": [m.brgb], "lr": 0.002})
     opt = torch.optim.Adam(groups)
     lr0 = [g["lr"] for g in opt.param_groups]
     for it in range(iters):
@@ -121,15 +136,18 @@ def fit_symbols(target, n_free, syms, iters=6000, lr=(0.05, 0.05, 0.02, 0.005)):
     return m
 
 
-def fit_auto(target_img, target, N, iters=6000, log=None):
-    """Find repeated shapes in the 8-bit picture (H,W,3 uint8 array); fit the
-    symbol layer + free blobs with N stored blobs in total. None if no repeats."""
-    syms = find_symbols(np.asarray(target_img).astype(np.float32))
-    if not syms:
+def fit_auto(target_img, target, N, iters=6000, log=None, use_symbols=True, use_boxes=True):
+    """Find boxes and repeated shapes in the 8-bit picture (H,W,3 uint8);
+    fit them + free blobs with N stored blobs in total. None if neither
+    is found (then a plain fit is the same thing)."""
+    a = np.asarray(target_img).astype(np.float32)
+    syms = find_symbols(a) if use_symbols else []
+    boxes = find_rects(a) if use_boxes else None
+    if not syms and (boxes is None or not len(boxes)):
         return None
     probe = SymbolImage(target, 1, syms)
     n_free = max(N - probe.n_proto_blobs, 1)
     if log:
-        log(f"  symbols: {len(syms)} prototypes, {probe.n_copies} copies, "
-            f"{probe.n_proto_blobs} prototype blobs + {n_free} free")
-    return fit_symbols(target, n_free, syms, iters)
+        log(f"  layers: {0 if boxes is None else len(boxes)} boxes, {len(syms)} prototypes, "
+            f"{probe.n_copies} copies, {probe.n_proto_blobs} prototype blobs + {n_free} free")
+    return fit_symbols(target, n_free, syms, iters, boxes=boxes)

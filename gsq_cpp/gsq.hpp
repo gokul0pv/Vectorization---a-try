@@ -2,7 +2,7 @@
 //   GSQ2: 6 channels, base step 1/127.5
 //   GSQ4: flags byte (bit 0: Beta blobs, 7th channel log k; bit 1: adaptive shape
 //         precision, then float aref + uint8 G; bit 2: symbol layer, then uint16 P +
-//         uint32 C + uint8 copy_e), base step 1/510
+//         uint32 C + uint8 copy_e; bit 3: boxes, then uint32 count), base step 1/510
 // Exact port of gsimg/sq.py decode + gsimg/model.py render (C++17, no deps).
 //
 //   gsq::Blobs b = gsq::decode(bytes);          // throws std::runtime_error
@@ -139,6 +139,8 @@ struct Blobs {
     std::vector<float> xy, l, rgb;   // N*2, N*3 (a,b,c), N*3
     std::vector<float> base;         // 3*bh*bw
     std::vector<float> k;            // Beta sharpness per blob; empty = Gaussians
+    std::vector<int32_t> boxes;      // N*4 x0 y0 x1 y1 (pixel-aligned, add their colour)
+    std::vector<float> box_rgb;      // N*3
     size_t size() const { return xy.size() / 2; }
 };
 
@@ -156,7 +158,7 @@ inline Blobs decode(const std::vector<uint8_t>& buf) {
     double k = rd<float>(p + 13);
     size_t o = 17;
     const uint8_t flags = v4 ? p[o++] : 0;
-    const bool beta = flags & 1, adaptive = flags & 2, symb = flags & 4;
+    const bool beta = flags & 1, adaptive = flags & 2, symb = flags & 4, hasb = flags & 8;
     double aref = 0; int G = 0;
     if (adaptive) {
         if (buf.size() < o + 5) throw std::runtime_error("truncated header");
@@ -168,8 +170,13 @@ inline Blobs decode(const std::vector<uint8_t>& buf) {
         if (buf.size() < o + 7) throw std::runtime_error("truncated header");
         P = rd<uint16_t>(p + o); C = rd<uint32_t>(p + o + 2); copy_e = p[o + 6]; o += 7;
     }
+    size_t NB = 0;
+    if (hasb) {
+        if (buf.size() < o + 4) throw std::runtime_error("truncated header");
+        NB = rd<uint32_t>(p + o); o += 4;
+    }
     const int nch = beta ? 7 : 6, na = nch + (adaptive ? 6 * G : 0);
-    const int nheads = 4 + na + (symb ? 1 + na + 2 + 3 : 0);
+    const int nheads = 4 + na + (symb ? 1 + na + 2 + 3 : 0) + (hasb ? 7 : 0);
     const size_t hdr = o + 4 * nch + 7 * size_t(nheads);
     if (buf.size() < hdr) throw std::runtime_error("truncated header");
     float steps[7];
@@ -280,6 +287,16 @@ inline Blobs decode(const std::vector<uint8_t>& buf) {
                           float(pyf[b] + double(oy) / COPY_Q));
         }
     }
+    if (hasb) {   // boxes in reading order: row delta, x0, w, h, r, g, b (1/510)
+        std::vector<std::vector<int64_t>> c(7);
+        for (int j = 0; j < 7; ++j) c[size_t(j)] = d.ints(NB, heads[hi++]);
+        int64_t y0 = 0;
+        for (size_t b = 0; b < NB; ++b) {
+            y0 += c[0][b];
+            B.boxes.insert(B.boxes.end(), {int32_t(c[1][b]), int32_t(y0), int32_t(c[1][b] + c[2][b]), int32_t(y0 + c[3][b])});
+            for (int j = 0; j < 3; ++j) B.box_rgb.push_back(float(double(c[size_t(4 + j)][b]) / 510.0));
+        }
+    }
     B.base.resize(base_q.size());
     const float bs = v4 ? 510.f : 127.5f;
     for (size_t j = 0; j < base_q.size(); ++j) B.base[j] = float(base_q[j]) / bs - 0.5f;
@@ -371,6 +388,14 @@ inline std::vector<float> render(const Blobs& B, float scale, int* out_w, int* o
     for (unsigned t = 1; t < nt; ++t)
         for (size_t j = 0; j < px_count; ++j) out[j] += acc[t][j];
     detail::bicubic_add(B.base, B.bh, B.bw, oh, ow, out);
+    for (size_t b = 0; b < B.boxes.size() / 4; ++b) {   // corners rounded to whole pixels at other scales
+        auto sc = [&](int32_t v, int lim) { return std::clamp(int(std::nearbyint(double(v) * scale)), 0, lim); };
+        int x0 = sc(B.boxes[4 * b], ow), y0 = sc(B.boxes[4 * b + 1], oh);
+        int x1 = sc(B.boxes[4 * b + 2], ow), y1 = sc(B.boxes[4 * b + 3], oh);
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x)
+                for (int ch = 0; ch < 3; ++ch) out[(size_t(y) * ow + x) * 3 + ch] += B.box_rgb[3 * b + ch];
+    }
     *out_w = ow; *out_h = oh;
     return out;
 }

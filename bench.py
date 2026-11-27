@@ -87,7 +87,7 @@ def bytes_for(pts, target_psnr):
 def cached_fit(name, tgt, N, iters, beta=False, img=None):
     """img given = try the symbol layer (repeated shapes); plain fit if none found."""
     CACHE.mkdir(parents=True, exist_ok=True)
-    f = CACHE / f"{name}_{tgt.shape[1]}_{N}_{iters}_r20{'_beta' if beta else ''}{'_sym' if img is not None else ''}.pt"
+    f = CACHE / f"{name}_{tgt.shape[1]}_{N}_{iters}_r20{'_beta' if beta else ''}{'_layers' if img is not None else ''}.pt"
     if f.exists():
         return torch.load(f, weights_only=False)
     m = symbols.fit_auto(img, tgt, N, iters, log=print) if img is not None else None
@@ -108,7 +108,7 @@ def main():
     ap.add_argument("--k", type=float, default=sq.K_POS)
     ap.add_argument("--tag", default="run")
     ap.add_argument("--beta", action="store_true", help="Beta blobs (sharpness k per blob, GSQ4)")
-    ap.add_argument("--symbols", action="store_true", help="symbol layer for repeated shapes (text, icons)")
+    ap.add_argument("--symbols", action="store_true", help="layers: boxes (panels, bars, lines) + symbols (repeated text, icons)")
     a = ap.parse_args()
     OUT.mkdir(exist_ok=True)
     res = OUT / f"results_{a.tag}.json"

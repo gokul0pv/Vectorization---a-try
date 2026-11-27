@@ -225,5 +225,12 @@ def decode(buf, device="cuda"):
 def render_decoded(d, scale=1.0):
     """Resolution-free: render at any scale from the same file."""
     s = scale
-    return render(d["xy"] * s, d["L"] * s, d["rgb"], d["base"],
-                  round(d["H"] * s), round(d["W"] * s), int(np.ceil(d["R"] * s)), d.get("cut", 0.0), k=d.get("k"))
+    H, W = round(d["H"] * s), round(d["W"] * s)
+    img = render(d["xy"] * s, d["L"] * s, d["rgb"], d["base"],
+                 H, W, int(np.ceil(d["R"] * s)), d.get("cut", 0.0), k=d.get("k"))
+    if d.get("boxes") is not None:
+        from .rects import render_rects
+        # boxes are pixel-aligned; at other scales their corners are rounded to whole pixels
+        b = torch.round(d["boxes"].double() * s).long()
+        img = img + render_rects(b, d["brgb"], H, W)
+    return img

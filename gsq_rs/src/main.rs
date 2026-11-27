@@ -12,7 +12,8 @@ use std::time::Instant;
 const MAGIC: &[u8; 4] = b"GSQ3"; // GSQ3: per-blob patch radius min(R, ceil(CUT*sigma_max))
 const MAGIC4: &[u8; 4] = b"GSQ4"; // GSQ4: flags byte (bit 0 Beta, 7th channel log k;
                                   // bit 1 adaptive shape precision + f32 aref + u8 G;
-                                  // bit 2 symbol layer + u16 P + u32 C + u8 copy_e), base step 1/510
+                                  // bit 2 symbol layer + u16 P + u32 C + u8 copy_e;
+                                  // bit 3 boxes + u32 count), base step 1/510
 const KMIN: f32 = 0.25;
 const KMAX: f32 = 12.0;
 const CUT: f32 = 4.0;
@@ -31,6 +32,8 @@ pub struct Blobs {
     pub bw: usize,
     pub cut: f32,         // 0 = full (2R+1)^2 patch (GSQ2)
     pub k: Vec<f32>,      // Beta sharpness per blob; empty = Gaussians
+    pub boxes: Vec<[i64; 4]>, // x0 y0 x1 y1, pixel-aligned, add their colour
+    pub box_rgb: Vec<[f32; 3]>,
 }
 
 fn rd<const N: usize>(b: &[u8], o: usize) -> [u8; N] {
@@ -122,6 +125,7 @@ pub fn decode(buf: &[u8]) -> Result<Blobs, String> {
     let beta = flags & 1 == 1;
     let adaptive = flags & 2 == 2;
     let symb = flags & 4 == 4;
+    let hasb = flags & 8 == 8;
     let (mut aref, mut gmax) = (0f64, 0i64);
     if adaptive {
         if buf.len() < o + 5 {
@@ -141,9 +145,17 @@ pub fn decode(buf: &[u8]) -> Result<Blobs, String> {
         copy_e = buf[o + 6] as i32;
         o += 7;
     }
+    let mut nbox = 0usize;
+    if hasb {
+        if buf.len() < o + 4 {
+            return Err("truncated header".into());
+        }
+        nbox = u32::from_le_bytes(rd(buf, o)) as usize;
+        o += 4;
+    }
     let nch = if beta { 7 } else { 6 };
     let na = nch + if adaptive { 6 * gmax as usize } else { 0 };
-    let nheads = 4 + na + if symb { 1 + na + 2 + 3 } else { 0 };
+    let nheads = 4 + na + if symb { 1 + na + 2 + 3 } else { 0 } + if hasb { 7 } else { 0 };
     let hdr = o + 4 * nch + 7 * nheads;
     if buf.len() < hdr {
         return Err("truncated header".into());
@@ -241,10 +253,23 @@ pub fn decode(buf: &[u8]) -> Result<Blobs, String> {
                 push(&psym[b], pmult[b], [x as f32, y as f32]);
             }
         }
+        hi += 5;
+    }
+    let mut boxes = Vec::new();
+    let mut box_rgb = Vec::new();
+    if hasb {
+        // reading order: row delta, x0, w, h, r, g, b (1/510)
+        let c: Vec<Vec<i64>> = (0..7).map(|j| d.ints(nbox, heads[hi + j])).collect();
+        let mut y0 = 0i64;
+        for b in 0..nbox {
+            y0 += c[0][b];
+            boxes.push([c[1][b], y0, c[1][b] + c[2][b], y0 + c[3][b]]);
+            box_rgb.push([0, 1, 2].map(|j| (c[4 + j][b] as f64 / 510.0) as f32));
+        }
     }
     let bs = if v4 { 510.0 } else { 127.5 };
     let base = base_q.iter().map(|&q| q as f32 / bs - 0.5).collect();
-    Ok(Blobs { h, w, r, xy, l, rgb, base, bh, bw, cut, k: kb })
+    Ok(Blobs { h, w, r, xy, l, rgb, base, bh, bw, cut, k: kb, boxes, box_rgb })
 }
 
 /// PyTorch bicubic (A = -0.75, align_corners = False, edge clamp).
@@ -346,6 +371,18 @@ pub fn render(bl: &Blobs, scale: f32) -> (usize, usize, Vec<f32>) {
         });
     }
     bicubic(&bl.base, bl.bh, bl.bw, oh, ow, &mut img);
+    for (b, c) in bl.boxes.iter().zip(&bl.box_rgb) {
+        // corners rounded to whole pixels at other scales
+        let sc = |v: i64, lim: usize| ((v as f64 * scale as f64).round_ties_even() as i64).clamp(0, lim as i64) as usize;
+        let (x0, y0, x1, y1) = (sc(b[0], ow), sc(b[1], oh), sc(b[2], ow), sc(b[3], oh));
+        for y in y0..y1 {
+            for x in x0..x1 {
+                for ch in 0..3 {
+                    img[(y * ow + x) * 3 + ch] += c[ch];
+                }
+            }
+        }
+    }
     (oh, ow, img)
 }
 
