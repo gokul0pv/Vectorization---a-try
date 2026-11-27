@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from gsimg import codec, sq
+from gsimg import codec, sq, symbols
 from gsimg.codec import render_decoded
 from gsimg.model import fit, psnr
 
@@ -84,12 +84,15 @@ def bytes_for(pts, target_psnr):
             return round(math.exp(math.log(b0) + f * (math.log(b1) - math.log(b0))))
 
 
-def cached_fit(name, tgt, N, iters, beta=False):
+def cached_fit(name, tgt, N, iters, beta=False, img=None):
+    """img given = try the symbol layer (repeated shapes); plain fit if none found."""
     CACHE.mkdir(parents=True, exist_ok=True)
-    f = CACHE / f"{name}_{tgt.shape[1]}_{N}_{iters}_r20{'_beta' if beta else ''}.pt"
+    f = CACHE / f"{name}_{tgt.shape[1]}_{N}_{iters}_r20{'_beta' if beta else ''}{'_sym' if img is not None else ''}.pt"
     if f.exists():
         return torch.load(f, weights_only=False)
-    m = fit(tgt, N, iters, log=print, beta=beta)
+    m = symbols.fit_auto(img, tgt, N, iters, log=print) if img is not None else None
+    if m is None:
+        m = fit(tgt, N, iters, log=print, beta=beta)
     torch.save(m, f)
     return m
 
@@ -105,6 +108,7 @@ def main():
     ap.add_argument("--k", type=float, default=sq.K_POS)
     ap.add_argument("--tag", default="run")
     ap.add_argument("--beta", action="store_true", help="Beta blobs (sharpness k per blob, GSQ4)")
+    ap.add_argument("--symbols", action="store_true", help="symbol layer for repeated shapes (text, icons)")
     a = ap.parse_args()
     OUT.mkdir(exist_ok=True)
     res = OUT / f"results_{a.tag}.json"
@@ -118,7 +122,7 @@ def main():
         curves = {f: curve(im, f) for f in ("JPEG", "WEBP", "AVIF")}
         lams = [float(x) for x in a.lam.split(",")] if a.mode == "sq" else [None]
         for N in map(int, a.n.split(",")):
-            m = cached_fit(name, tgt, N, a.iters, a.beta)
+            m = cached_fit(name, tgt, N, a.iters, a.beta, np.asarray(im) if a.symbols else None)
             raw = psnr(m().detach(), tgt)
             for lam in lams:
                 print(f"{name} {im.size} N={N} mode={a.mode} lam={lam}")
@@ -130,7 +134,7 @@ def main():
                     q = codec.quantize(m, tgt, 1, 1, 1500, log=print)
                     buf, dec, ext = codec.encode(q), codec.decode, "gsi"
                 t_enc = time.time() - t0
-                stem = f"{name}_{N}_{a.mode}{'' if lam is None else f'_{lam}'}{'_beta' if a.beta else ''}"
+                stem = f"{name}_{N}_{a.mode}{'' if lam is None else f'_{lam}'}{'_beta' if a.beta else ''}{'_sym' if a.symbols else ''}"
                 (OUT / f"{stem}.{ext}").write_bytes(buf)
                 t1 = time.time()
                 d = dec(buf)
@@ -141,7 +145,7 @@ def main():
                     # measured on the real 8-bit picture, exactly like JPEG/WebP/AVIF
                     p = psnr8(rec, tgt)
                     to_im(rec).save(OUT / f"{stem}_gs.png")
-                row = dict(image=name, N=N, beta=a.beta, kept=int(d["xy"].shape[0]), mode=a.mode, lam=lam,
+                row = dict(image=name, N=N, beta=a.beta, symbols=a.symbols, kept=int(d["xy"].shape[0]), mode=a.mode, lam=lam,
                            bytes=len(buf), bpp=round(8 * len(buf) / (im.width * im.height), 3),
                            psnr_float=round(raw, 2), psnr_file=round(p, 2), png_bytes=png,
                            enc_s=round(t_enc, 1), dec_s=round(t_dec, 2))

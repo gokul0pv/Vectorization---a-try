@@ -11,7 +11,8 @@ use std::time::Instant;
 
 const MAGIC: &[u8; 4] = b"GSQ3"; // GSQ3: per-blob patch radius min(R, ceil(CUT*sigma_max))
 const MAGIC4: &[u8; 4] = b"GSQ4"; // GSQ4: flags byte (bit 0 Beta, 7th channel log k;
-                                  // bit 1 adaptive shape precision + f32 aref + u8 G), base step 1/510
+                                  // bit 1 adaptive shape precision + f32 aref + u8 G;
+                                  // bit 2 symbol layer + u16 P + u32 C + u8 copy_e), base step 1/510
 const KMIN: f32 = 0.25;
 const KMAX: f32 = 12.0;
 const CUT: f32 = 4.0;
@@ -56,6 +57,52 @@ fn shape_g(cs: &[i64], st: &[f32], aref: f64, g: i64) -> i64 {
     ((amp / aref).log2().round_ties_even() as i64).clamp(-g, g)
 }
 
+type Head = (u8, i32, i16);
+
+/// Attribute columns (sq._read_attrs): m rows of nch symbols + shape step multiplier.
+#[allow(clippy::too_many_arguments)]
+fn read_attrs(
+    d: &mut ac::Decoder, m: usize, heads: &[Head], hi: &mut usize, steps: &[f32], adaptive: bool,
+    aref: f64, gmax: i64, nch: usize,
+) -> (Vec<Vec<i64>>, Vec<f64>) {
+    let mut sym = vec![vec![0i64; nch]; m];
+    let mut mult = vec![1f64; m];
+    let col_all = |d: &mut ac::Decoder, sym: &mut Vec<Vec<i64>>, j: usize, hi: &mut usize| {
+        let col = d.ints(m, heads[*hi]);
+        *hi += 1;
+        for i in 0..m {
+            sym[i][j] = col[i];
+        }
+    };
+    if !adaptive {
+        for j in 0..nch {
+            col_all(d, &mut sym, j, hi);
+        }
+        return (sym, mult);
+    }
+    for j in 3..6 {
+        col_all(d, &mut sym, j, hi);
+    }
+    let g: Vec<i64> = sym.iter().map(|s| shape_g(&s[3..6], &steps[3..6], aref, gmax)).collect();
+    for i in 0..m {
+        mult[i] = 2f64.powi(-g[i] as i32);
+    }
+    for j in 0..3 {
+        for v in -gmax..=gmax {
+            let idx: Vec<usize> = (0..m).filter(|&i| g[i] == v).collect();
+            let col = d.ints(idx.len(), heads[*hi]);
+            *hi += 1;
+            for (c, &i) in idx.iter().enumerate() {
+                sym[i][j] = col[c];
+            }
+        }
+    }
+    for j in 6..nch {
+        col_all(d, &mut sym, j, hi);
+    }
+    (sym, mult)
+}
+
 pub fn decode(buf: &[u8]) -> Result<Blobs, String> {
     if buf.len() < 18 || (&buf[..4] != MAGIC && &buf[..4] != MAGIC4 && &buf[..4] != b"GSQ2") {
         return Err("not a GSQ2/GSQ3/GSQ4 file".into());
@@ -74,6 +121,7 @@ pub fn decode(buf: &[u8]) -> Result<Blobs, String> {
     }
     let beta = flags & 1 == 1;
     let adaptive = flags & 2 == 2;
+    let symb = flags & 4 == 4;
     let (mut aref, mut gmax) = (0f64, 0i64);
     if adaptive {
         if buf.len() < o + 5 {
@@ -83,19 +131,31 @@ pub fn decode(buf: &[u8]) -> Result<Blobs, String> {
         gmax = buf[o + 4] as i64;
         o += 5;
     }
+    let (mut np, mut nc, mut copy_e) = (0usize, 0usize, 0i32);
+    if symb {
+        if buf.len() < o + 7 {
+            return Err("truncated header".into());
+        }
+        np = u16::from_le_bytes(rd(buf, o)) as usize;
+        nc = u32::from_le_bytes(rd(buf, o + 2)) as usize;
+        copy_e = buf[o + 6] as i32;
+        o += 7;
+    }
     let nch = if beta { 7 } else { 6 };
-    let ncols = nch + if adaptive { 6 * gmax as usize } else { 0 };
-    let hdr = o + 4 * nch + 7 * (4 + ncols);
+    let na = nch + if adaptive { 6 * gmax as usize } else { 0 };
+    let nheads = 4 + na + if symb { 1 + na + 2 + 3 } else { 0 };
+    let hdr = o + 4 * nch + 7 * nheads;
     if buf.len() < hdr {
         return Err("truncated header".into());
     }
     let steps: Vec<f32> = (0..nch).map(|j| f32::from_le_bytes(rd(buf, o + 4 * j))).collect();
     o += 4 * nch;
-    let mut heads = Vec::new();
-    for i in 0..4 + ncols {
-        let p = o + 7 * i;
-        heads.push((buf[p], i32::from_le_bytes(rd(buf, p + 1)), i16::from_le_bytes(rd(buf, p + 5))));
-    }
+    let heads: Vec<Head> = (0..nheads)
+        .map(|i| {
+            let p = o + 7 * i;
+            (buf[p], i32::from_le_bytes(rd(buf, p + 1)), i16::from_le_bytes(rd(buf, p + 5)))
+        })
+        .collect();
     let mut d = ac::Decoder::new(&buf[hdr..]);
     let bh = 2.max(h.div_ceil(32));
     let bw = 2.max(w.div_ceil(32));
@@ -104,78 +164,83 @@ pub fn decode(buf: &[u8]) -> Result<Blobs, String> {
     let counts = d.ints(nb, heads[1]);
     let dx = d.ints(n, heads[2]);
     let yin = d.ints(n, heads[3]);
-    let mut sym = vec![vec![0i64; nch]; n];
-    let mut mult = vec![1f64; n];
     let mut hi = 4;
-    if !adaptive {
-        for j in 0..nch {
-            let col = d.ints(n, heads[hi]);
-            hi += 1;
-            for i in 0..n {
-                sym[i][j] = col[i];
-            }
-        }
-    } else {
-        for j in 3..6 {
-            let col = d.ints(n, heads[hi]);
-            hi += 1;
-            for i in 0..n {
-                sym[i][j] = col[i];
-            }
-        }
-        let g: Vec<i64> = sym.iter().map(|s| shape_g(&s[3..6], &steps[3..6], aref, gmax)).collect();
-        for i in 0..n {
-            mult[i] = 2f64.powi(-g[i] as i32);
-        }
-        for j in 0..3 {
-            for v in -gmax..=gmax {
-                let idx: Vec<usize> = (0..n).filter(|&i| g[i] == v).collect();
-                let col = d.ints(idx.len(), heads[hi]);
-                hi += 1;
-                for (c, &i) in idx.iter().enumerate() {
-                    sym[i][j] = col[c];
-                }
-            }
-        }
-        for j in 6..nch {
-            let col = d.ints(n, heads[hi]);
-            hi += 1;
-            for i in 0..n {
-                sym[i][j] = col[i];
-            }
-        }
-    }
+    let (sym, mult) = read_attrs(&mut d, n, &heads, &mut hi, &steps, adaptive, aref, gmax, nch);
     let e: Vec<u32> = sym.iter().zip(&mult).map(|(s, &m)| pos_exp(s, &steps, k, m)).collect();
     let frac: Vec<(i64, i64)> = e.iter().map(|&ei| (d.raw(ei), d.raw(ei))).collect();
 
     let mut xy = Vec::with_capacity(n);
+    let mut l = Vec::with_capacity(n);
+    let mut rgb = Vec::with_capacity(n);
+    let mut kb = Vec::new();
+    let mut push = |s: &[i64], m: f64, p: [f32; 2]| {
+        let v: Vec<f32> = (0..nch).map(|j| (s[j] as f64 * if j < 3 { m } else { 1.0 }) as f32 * steps[j]).collect();
+        if beta {
+            kb.push(v[6].exp().clamp(KMIN, KMAX));
+        }
+        xy.push(p);
+        l.push([v[0].exp(), v[1], v[2].exp()]);
+        let (y, co, cg) = (v[3], v[4], v[5]);
+        rgb.push([y + co - cg, y + cg, y - co - cg]);
+    };
     let mut i = 0usize;
     for (band, &c) in counts.iter().enumerate() {
         let mut cx = 0i64;
         for _ in 0..c {
+            if i >= n {
+                return Err("bad band counts".into());
+            }
             cx += dx[i];
             let cy = band as i64 * BAND + yin[i];
             let s = (1i64 << e[i]) as f64;
             let ux = ((cx << e[i]) + frac[i].0) as f64;
             let uy = ((cy << e[i]) + frac[i].1) as f64;
-            xy.push([(ux / s - r as f64) as f32, (uy / s - r as f64) as f32]);
+            push(&sym[i], mult[i], [(ux / s - r as f64) as f32, (uy / s - r as f64) as f32]);
             i += 1;
         }
     }
     if i != n {
         return Err(format!("band counts sum to {i}, expected {n}"));
     }
-    let mut l = Vec::with_capacity(n);
-    let mut rgb = Vec::with_capacity(n);
-    let mut kb = Vec::new();
-    for (s, &m) in sym.iter().zip(&mult) {
-        let v: Vec<f32> = (0..nch).map(|j| (s[j] as f64 * if j < 3 { m } else { 1.0 }) as f32 * steps[j]).collect();
-        if beta {
-            kb.push(v[6].exp().clamp(KMIN, KMAX));
+    if symb {
+        // symbol layer: prototypes stored once, drawn at every copy
+        let copy_q = 2f64.powi(copy_e);
+        let pcount = d.ints(np, heads[hi]);
+        hi += 1;
+        let mut first = Vec::with_capacity(np);
+        let mut npb = 0usize;
+        for &c in &pcount {
+            first.push(npb);
+            npb += c as usize;
         }
-        l.push([v[0].exp(), v[1], v[2].exp()]);
-        let (y, co, cg) = (v[3], v[4], v[5]);
-        rgb.push([y + co - cg, y + cg, y - co - cg]);
+        let (psym, pmult) = read_attrs(&mut d, npb, &heads, &mut hi, &steps, adaptive, aref, gmax, nch);
+        let px = d.ints(npb, heads[hi]);
+        let py = d.ints(npb, heads[hi + 1]);
+        let cproto = d.ints(nc, heads[hi + 2]);
+        let dy = d.ints(nc, heads[hi + 3]);
+        let cxq = d.ints(nc, heads[hi + 4]);
+        let ep: Vec<u32> = psym.iter().zip(&pmult).map(|(s, &m)| pos_exp(s, &steps, k, m)).collect();
+        let pf: Vec<[f64; 2]> = (0..npb)
+            .map(|b| {
+                let (fx, fy) = (d.raw(ep[b]), d.raw(ep[b]));
+                let s = (1i64 << ep[b]) as f64;
+                [((px[b] << ep[b]) + fx) as f64 / s, ((py[b] << ep[b]) + fy) as f64 / s]
+            })
+            .collect();
+        let (mut oy, mut ox) = (0i64, 0i64);
+        for c in 0..nc {
+            oy += dy[c];
+            ox = if c > 0 && dy[c] == 0 { ox + cxq[c] } else { cxq[c] };
+            let q = cproto[c] as usize;
+            if q >= np {
+                return Err("bad prototype id".into());
+            }
+            for b in first[q]..first[q] + pcount[q] as usize {
+                let x = pf[b][0] + ox as f64 / copy_q;
+                let y = pf[b][1] + oy as f64 / copy_q;
+                push(&psym[b], pmult[b], [x as f32, y as f32]);
+            }
+        }
     }
     let bs = if v4 { 510.0 } else { 127.5 };
     let base = base_q.iter().map(|&q| q as f32 / bs - 0.5).collect();

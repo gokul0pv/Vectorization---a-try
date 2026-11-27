@@ -1,7 +1,8 @@
 // gsq.hpp - single-header decoder + renderer for .gsq blob images.
 //   GSQ2: 6 channels, base step 1/127.5
 //   GSQ4: flags byte (bit 0: Beta blobs, 7th channel log k; bit 1: adaptive shape
-//         precision, then float aref + uint8 G), base step 1/510
+//         precision, then float aref + uint8 G; bit 2: symbol layer, then uint16 P +
+//         uint32 C + uint8 copy_e), base step 1/510
 // Exact port of gsimg/sq.py decode + gsimg/model.py render (C++17, no deps).
 //
 //   gsq::Blobs b = gsq::decode(bytes);          // throws std::runtime_error
@@ -124,7 +125,7 @@ inline unsigned pos_exp(const int64_t* s, const float* steps, double k, double s
     return unsigned(std::clamp(std::nearbyint(-std::log2(r)), 0.0, 7.0));   // ties to even
 }
 // Shape precision group from the quantised colour (same as sq.shape_g, f64).
-inline int shape_g(const int64_t* csym, const float* csteps, double aref, int G) {
+inline int shape_g(const int64_t* csym, const float* csteps, double aref, int G) {  // csym: Y, Co, Cg
     double y = double(csym[0]) * double(csteps[0]), co = double(csym[1]) * double(csteps[1]),
            cg = double(csym[2]) * double(csteps[2]);
     double amp = std::max({std::fabs(y + co - cg), std::fabs(y + cg), std::fabs(y - co - cg), 1e-4});
@@ -155,19 +156,26 @@ inline Blobs decode(const std::vector<uint8_t>& buf) {
     double k = rd<float>(p + 13);
     size_t o = 17;
     const uint8_t flags = v4 ? p[o++] : 0;
-    const bool beta = flags & 1, adaptive = flags & 2;
+    const bool beta = flags & 1, adaptive = flags & 2, symb = flags & 4;
     double aref = 0; int G = 0;
     if (adaptive) {
         if (buf.size() < o + 5) throw std::runtime_error("truncated header");
         aref = rd<float>(p + o); G = p[o + 4]; o += 5;
     }
-    const int nch = beta ? 7 : 6, ncols = nch + (adaptive ? 6 * G : 0);
-    const size_t hdr = o + 4 * nch + 7 * (4 + ncols);
+    size_t P = 0, C = 0;
+    int copy_e = 0;
+    if (symb) {
+        if (buf.size() < o + 7) throw std::runtime_error("truncated header");
+        P = rd<uint16_t>(p + o); C = rd<uint32_t>(p + o + 2); copy_e = p[o + 6]; o += 7;
+    }
+    const int nch = beta ? 7 : 6, na = nch + (adaptive ? 6 * G : 0);
+    const int nheads = 4 + na + (symb ? 1 + na + 2 + 3 : 0);
+    const size_t hdr = o + 4 * nch + 7 * size_t(nheads);
     if (buf.size() < hdr) throw std::runtime_error("truncated header");
     float steps[7];
     for (int j = 0; j < nch; ++j, o += 4) steps[j] = rd<float>(p + o);
-    std::vector<Decoder::Head> heads(size_t(4 + ncols));
-    for (int i = 0; i < 4 + ncols; ++i, o += 7) heads[size_t(i)] = {p[o], rd<int32_t>(p + o + 1), rd<int16_t>(p + o + 5)};
+    std::vector<Decoder::Head> heads(static_cast<size_t>(nheads));
+    for (int i = 0; i < nheads; ++i, o += 7) heads[size_t(i)] = {p[o], rd<int32_t>(p + o + 1), rd<int16_t>(p + o + 5)};
     Decoder d(p + hdr, buf.size() - hdr);
     B.bh = std::max(2, (B.h + 31) / 32);
     B.bw = std::max(2, (B.w + 31) / 32);
@@ -177,44 +185,53 @@ inline Blobs decode(const std::vector<uint8_t>& buf) {
     auto counts = d.ints(nb, heads[1]);
     auto dx = d.ints(n, heads[2]);
     auto yin = d.ints(n, heads[3]);
-    std::vector<int64_t> sym(n * nch);
-    std::vector<double> mult(n, 1.0);
     size_t hi = 4;
-    auto col_all = [&](int j) {
-        auto col = d.ints(n, heads[hi++]);
-        for (size_t i = 0; i < n; ++i) sym[i * nch + j] = col[i];
-    };
-    if (!adaptive) {
-        for (int j = 0; j < nch; ++j) col_all(j);
-    } else {
+
+    // attribute columns (sq._read_attrs): sym is m x nch, mult = shape step multiplier
+    auto read_attrs = [&](size_t m, std::vector<int64_t>& sym, std::vector<double>& mult) {
+        sym.assign(m * nch, 0);
+        mult.assign(m, 1.0);
+        auto col_all = [&](int j) {
+            auto col = d.ints(m, heads[hi++]);
+            for (size_t i = 0; i < m; ++i) sym[i * nch + j] = col[i];
+        };
+        if (!adaptive) {
+            for (int j = 0; j < nch; ++j) col_all(j);
+            return;
+        }
         for (int j = 3; j < 6; ++j) col_all(j);
-        std::vector<int> g(n);
-        std::vector<int64_t> c3(3);
-        for (size_t i = 0; i < n; ++i) {
-            for (int j = 0; j < 3; ++j) c3[size_t(j)] = sym[i * nch + 3 + j];
-            g[i] = shape_g(c3.data(), steps + 3, aref, G);
+        std::vector<int> g(m);
+        for (size_t i = 0; i < m; ++i) {
+            g[i] = shape_g(&sym[i * nch + 3], steps + 3, aref, G);
             mult[i] = std::ldexp(1.0, -g[i]);
         }
         for (int j = 0; j < 3; ++j)
             for (int v = -G; v <= G; ++v) {
                 size_t cnt = 0;
-                for (size_t i = 0; i < n; ++i) cnt += g[i] == v;
+                for (size_t i = 0; i < m; ++i) cnt += g[i] == v;
                 auto col = d.ints(cnt, heads[hi++]);
                 size_t c = 0;
-                for (size_t i = 0; i < n; ++i) if (g[i] == v) sym[i * nch + j] = col[c++];
+                for (size_t i = 0; i < m; ++i) if (g[i] == v) sym[i * nch + j] = col[c++];
             }
         for (int j = 6; j < nch; ++j) col_all(j);
-    }
+    };
+    auto push_blob = [&](const int64_t* s, double m, float x, float y) {
+        float v[7];
+        for (int j = 0; j < nch; ++j) v[j] = float(double(s[j]) * (j < 3 ? m : 1.0)) * steps[j];
+        B.xy.push_back(x); B.xy.push_back(y);
+        B.l.push_back(std::exp(v[0])); B.l.push_back(v[1]); B.l.push_back(std::exp(v[2]));
+        B.rgb.push_back(v[3] + v[4] - v[5]); B.rgb.push_back(v[3] + v[5]); B.rgb.push_back(v[3] - v[4] - v[5]);
+        if (beta) B.k.push_back(std::clamp(std::exp(v[6]), KMIN, KMAX));
+    };
+
+    std::vector<int64_t> sym;
+    std::vector<double> mult;
+    read_attrs(n, sym, mult);
     std::vector<unsigned> e(n);
-    for (size_t i = 0; i < n; ++i) {
-        int64_t s6[7];
-        for (int j = 0; j < nch; ++j) s6[j] = sym[i * nch + j];
-        e[i] = pos_exp(s6, steps, k, mult[i]);
-    }
+    for (size_t i = 0; i < n; ++i) e[i] = pos_exp(&sym[i * nch], steps, k, mult[i]);
     std::vector<int64_t> fx(n), fy(n);
     for (size_t i = 0; i < n; ++i) { fx[i] = d.raw(e[i]); fy[i] = d.raw(e[i]); }
 
-    B.xy.resize(n * 2); B.l.resize(n * 3); B.rgb.resize(n * 3);
     size_t i = 0;
     for (size_t band = 0; band < nb; ++band) {
         int64_t cx = 0;
@@ -223,17 +240,45 @@ inline Blobs decode(const std::vector<uint8_t>& buf) {
             cx += dx[i];
             int64_t cy = int64_t(band) * BAND + yin[i];
             double s = double(int64_t(1) << e[i]);
-            B.xy[2 * i] = float(double((cx << e[i]) + fx[i]) / s - B.r);
-            B.xy[2 * i + 1] = float(double((cy << e[i]) + fy[i]) / s - B.r);
+            push_blob(&sym[i * nch], mult[i], float(double((cx << e[i]) + fx[i]) / s - B.r),
+                      float(double((cy << e[i]) + fy[i]) / s - B.r));
         }
     }
     if (i != n) throw std::runtime_error("bad band counts");
-    for (size_t g = 0; g < n; ++g) {
-        float v[7];
-        for (int j = 0; j < nch; ++j) v[j] = float(double(sym[g * nch + j]) * (j < 3 ? mult[g] : 1.0)) * steps[j];
-        B.l[3 * g] = std::exp(v[0]); B.l[3 * g + 1] = v[1]; B.l[3 * g + 2] = std::exp(v[2]);
-        B.rgb[3 * g] = v[3] + v[4] - v[5]; B.rgb[3 * g + 1] = v[3] + v[5]; B.rgb[3 * g + 2] = v[3] - v[4] - v[5];
-        if (beta) B.k.push_back(std::clamp(std::exp(v[6]), KMIN, KMAX));
+
+    if (symb) {   // symbol layer: prototypes (stored once) drawn at every copy
+        const double COPY_Q = std::ldexp(1.0, copy_e);
+        auto pcount = d.ints(P, heads[hi++]);
+        size_t npb = 0;
+        std::vector<size_t> first(P);
+        for (size_t q = 0; q < P; ++q) { first[q] = npb; npb += size_t(pcount[q]); }
+        std::vector<int64_t> psym;
+        std::vector<double> pmult;
+        read_attrs(npb, psym, pmult);
+        std::vector<unsigned> ep(npb);
+        for (size_t b = 0; b < npb; ++b) ep[b] = pos_exp(&psym[b * nch], steps, k, pmult[b]);
+        auto px = d.ints(npb, heads[hi++]);
+        auto py = d.ints(npb, heads[hi++]);
+        auto cproto = d.ints(C, heads[hi++]);
+        auto dy = d.ints(C, heads[hi++]);
+        auto cxq = d.ints(C, heads[hi++]);
+        std::vector<double> pxf(npb), pyf(npb);
+        for (size_t b = 0; b < npb; ++b) {
+            int64_t fx = d.raw(ep[b]), fy = d.raw(ep[b]);
+            double s = std::ldexp(1.0, int(ep[b]));
+            pxf[b] = double(px[b] * (int64_t(1) << ep[b]) + fx) / s;
+            pyf[b] = double(py[b] * (int64_t(1) << ep[b]) + fy) / s;
+        }
+        int64_t oy = 0, ox = 0;
+        for (size_t c = 0; c < C; ++c) {
+            oy += dy[c];
+            ox = (c > 0 && dy[c] == 0) ? ox + cxq[c] : cxq[c];
+            size_t q = size_t(cproto[c]);
+            if (q >= P) throw std::runtime_error("bad prototype id");
+            for (size_t b = first[q]; b < first[q] + size_t(pcount[q]); ++b)
+                push_blob(&psym[b * nch], pmult[b], float(pxf[b] + double(ox) / COPY_Q),
+                          float(pyf[b] + double(oy) / COPY_Q));
+        }
     }
     B.base.resize(base_q.size());
     const float bs = v4 ? 510.f : 127.5f;
