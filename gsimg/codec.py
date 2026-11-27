@@ -226,4 +226,4 @@ def render_decoded(d, scale=1.0):
     """Resolution-free: render at any scale from the same file."""
     s = scale
     return render(d["xy"] * s, d["L"] * s, d["rgb"], d["base"],
-                  round(d["H"] * s), round(d["W"] * s), int(np.ceil(d["R"] * s)), d.get("cut", 0.0))
+                  round(d["H"] * s), round(d["W"] * s), int(np.ceil(d["R"] * s)), d.get("cut", 0.0), k=d.get("k"))

@@ -16,9 +16,11 @@ import torch.nn.functional as F
 
 from . import ac
 from .codec import feat_to_L, shape_feat
-from .model import CUT, base_shape, psnr, render
+from .model import CUT, KMAX, KMIN, base_shape, psnr, render
 
 MAGIC = b"GSQ2"   # (GSQ3 = per-blob patch radius rule; off, see model.CUT)
+MAGIC_BETA = b"GSQ4"   # + a 7th coded channel: log k (Beta blob sharpness)
+K_STEP0 = 0.1
 BAND = 8
 EMAX = 7          # finest position step 1/128 px
 K_POS = 0.006     # position step ~ K_POS * sigma_min / colour amplitude
@@ -62,7 +64,12 @@ class SQ(torch.nn.Module):
         super().__init__()
         self.H, self.W, self.R, self.k = m.H, m.W, m.R, float(np.float32(k))
         P = torch.nn.Parameter
-        lat = torch.cat([shape_feat(m.L()), rgb2ycc(m.rgb)], 1).detach()
+        self.beta = bool(getattr(m, "beta", False))
+        lat = [shape_feat(m.L()), rgb2ycc(m.rgb)]
+        if self.beta:
+            lat.append(m.K().log()[:, None])
+            steps = tuple(steps) + (K_STEP0,)
+        lat = torch.cat(lat, 1).detach()
         st = torch.tensor(steps, device=lat.device)
         self.xy = P(m.xy.detach().clone())
         self.lat = P(lat)
@@ -93,16 +100,17 @@ class SQ(torch.nn.Module):
             sc = torch.as_tensor(2.0 ** e, dtype=self.xy.dtype, device=self.xy.device)[:, None]
         xy = _ste(self.xy, torch.round(self.xy * sc) / sc)
         base = _ste(self.base, torch.round((self.base.clamp(-0.5, 1.5) + 0.5) * 127.5) / 127.5 - 0.5)
-        return xy, feat_to_L(v[:, :3]), ycc2rgb(v[:, 3:]), base, bits
+        k = v[:, 6].exp().clamp(KMIN, KMAX) if self.beta else None
+        return xy, feat_to_L(v[:, :3]), ycc2rgb(v[:, 3:6]), base, bits, k
 
     def forward(self):
-        xy, L, rgb, base, bits = self.parts()
-        return render(xy, L, rgb, base, self.H, self.W, self.R), bits
+        xy, L, rgb, base, bits, k = self.parts()
+        return render(xy, L, rgb, base, self.H, self.W, self.R, k=k), bits
 
     @torch.no_grad()
     def prune(self):
         """Drop Gaussians whose quantised colour is exactly zero (invisible)."""
-        keep = (self.symbols()[:, 3:] != 0).any(1)
+        keep = (self.symbols()[:, 3:6] != 0).any(1)
         for name in ("xy", "lat"):
             p = getattr(self, name)
             setattr(self, name, torch.nn.Parameter(p[keep].clone()))
@@ -188,24 +196,26 @@ def encode(q):
         base = np.round((q.base.clamp(-0.5, 1.5).cpu().numpy() + 0.5) * 127.5).astype(np.int64).reshape(-1)
         enc = ac.Encoder()
         heads = [ac.put_ints(enc, s) for s in
-                 [base, counts, dx, yin] + [sym[:, j] for j in range(6)]]
+                 [base, counts, dx, yin] + [sym[:, j] for j in range(sym.shape[1])]]
         for (fx, fy), ei in zip(frac.tolist(), e.tolist()):
             enc.raw(fx, ei)
             enc.raw(fy, ei)
         body = enc.finish()
-        head = MAGIC + struct.pack("<HHBIf", H, W, R, N, q.k) + steps.astype(np.float32).tobytes()
+        head = (MAGIC_BETA if q.beta else MAGIC) + struct.pack("<HHBIf", H, W, R, N, q.k) + steps.astype(np.float32).tobytes()
         head += b"".join(struct.pack("<Bih", m, lo, a) for m, lo, a in heads)
         return head + body
 
 
 def decode(buf, device="cuda"):
-    assert buf[:4] in (MAGIC, b"GSQ2")
-    cut = CUT if buf[:4] == MAGIC else 0.0
+    assert buf[:4] in (MAGIC, MAGIC_BETA)
+    beta = buf[:4] == MAGIC_BETA
+    cut = 0.0
+    nch = 7 if beta else 6
     H, W, R, N, k = struct.unpack("<HHBIf", buf[4:17])
-    steps = np.frombuffer(buf[17:41], np.float32)
-    o = 41
+    steps = np.frombuffer(buf[17:17 + 4 * nch], np.float32)
+    o = 17 + 4 * nch
     heads = []
-    for _ in range(10):
+    for _ in range(4 + nch):
         heads.append(struct.unpack("<Bih", buf[o:o + 7]))
         o += 7
     dec = ac.Decoder(buf[o:])
@@ -215,7 +225,7 @@ def decode(buf, device="cuda"):
     counts = ac.get_ints(dec, nb, heads[1])
     dx = ac.get_ints(dec, N, heads[2])
     yin = ac.get_ints(dec, N, heads[3])
-    sym = np.stack([ac.get_ints(dec, N, heads[4 + j]) for j in range(6)], 1)
+    sym = np.stack([ac.get_ints(dec, N, heads[4 + j]) for j in range(nch)], 1)
     e = pos_exp(sym, steps, np.float32(k))
     frac = np.array([(dec.raw(ei), dec.raw(ei)) for ei in e.tolist()], np.int64).reshape(N, 2)
     band = np.repeat(np.arange(nb), counts)
@@ -229,4 +239,5 @@ def decode(buf, device="cuda"):
     t = lambda a: torch.as_tensor(a, device=device)
     v = t(sym.astype(np.float32)) * t(steps.copy())
     base = t(base.reshape(1, 3, bh, bw).astype(np.float32) / 127.5 - 0.5)
-    return dict(xy=t(xy), L=feat_to_L(v[:, :3]), rgb=ycc2rgb(v[:, 3:]), base=base, H=H, W=W, R=R, cut=cut)
+    kb = v[:, 6].exp().clamp(KMIN, KMAX) if beta else None
+    return dict(xy=t(xy), L=feat_to_L(v[:, :3]), rgb=ycc2rgb(v[:, 3:6]), base=base, H=H, W=W, R=R, cut=cut, k=kb)

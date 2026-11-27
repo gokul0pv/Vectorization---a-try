@@ -104,5 +104,7 @@ class Splat(torch.autograd.Function):
         return gxy, gL, grgb, None, None, None
 
 
-def splat(xy, L, rgb, H, W, R):
+def splat(xy, L, rgb, H, W, R, k=None):
+    if k is not None:
+        raise NotImplementedError("Triton kernel draws Gaussian blobs only; use the CUDA kernel for Beta")
     return Splat.apply(xy, L, rgb, H, W, R)
