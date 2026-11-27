@@ -401,7 +401,7 @@ def decode(buf, device="cuda"):
         if fl & 2:
             aref, G = struct.unpack("<fB", buf[o:o + 5])
             o += 5
-    P = C = 0
+    P = C = npb = 0
     if symb:
         P, C, copy_e = struct.unpack("<HIB", buf[o:o + 7])
         o += 7
@@ -476,4 +476,5 @@ def decode(buf, device="cuda"):
     base = t(base.reshape(1, 3, bh, bw).astype(np.float32) / BASE_SCALE[mg] - 0.5)
     kb = v[:, 6].exp().clamp(KMIN, KMAX) if beta else None
     return dict(xy=t(xy), L=feat_to_L(v[:, :3]), rgb=ycc2rgb(v[:, 3:6]), base=base, H=H, W=W, R=R, cut=cut, k=kb,
-                boxes=boxes, brgb=brgb)
+                boxes=boxes, brgb=brgb,
+                n_free=N, n_protos=P, n_proto_blobs=npb, n_copies=C)   # free blobs come first in xy
