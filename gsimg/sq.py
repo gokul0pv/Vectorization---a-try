@@ -18,9 +18,14 @@ from . import ac
 from .codec import feat_to_L, shape_feat
 from .model import CUT, KMAX, KMIN, base_shape, psnr, render
 
-MAGIC = b"GSQ2"   # (GSQ3 = per-blob patch radius rule; off, see model.CUT)
-MAGIC_BETA = b"GSQ4"   # + a 7th coded channel: log k (Beta blob sharpness)
+# GSQ2: 6 channels, base step 1/127.5.  (GSQ3 = per-blob patch radius rule; off, see model.CUT)
+# GSQ4: + flags byte after the header (bit 0: Beta blobs, 7th channel log k),
+#       base step 1/510 (the 7-bit base cost up to 2.7 dB on flat screenshots).
+MAGIC_OLD, MAGIC = b"GSQ2", b"GSQ4"
+BASE_SCALE = {MAGIC_OLD: 127.5, MAGIC: 510.0}
+BASE_S = BASE_SCALE[MAGIC]
 K_STEP0 = 0.1
+MIXED = False    # stage A: rate from noisy values, picture from rounded (STE)
 BAND = 8
 EMAX = 7          # finest position step 1/128 px
 K_POS = 0.006     # position step ~ K_POS * sigma_min / colour amplitude
@@ -89,9 +94,10 @@ class SQ(torch.nn.Module):
         y = self.lat / step
         if self.hard:
             yq = _ste(y, torch.round(y))
+            v = yq * step
         else:
             yq = y + torch.rand_like(y) - 0.5
-        v = yq * step
+            v = (_ste(y, torch.round(y)) if MIXED else yq) * step
         b = self.logb.exp()
         p = _lap_cdf(yq + 0.5, self.mu, b) - _lap_cdf(yq - 0.5, self.mu, b)
         bits = -torch.log2(p.clamp_min(1e-9)).sum()
@@ -99,7 +105,7 @@ class SQ(torch.nn.Module):
             e = pos_exp(torch.round(y).cpu().numpy(), step.detach().cpu().numpy(), self.k)
             sc = torch.as_tensor(2.0 ** e, dtype=self.xy.dtype, device=self.xy.device)[:, None]
         xy = _ste(self.xy, torch.round(self.xy * sc) / sc)
-        base = _ste(self.base, torch.round((self.base.clamp(-0.5, 1.5) + 0.5) * 127.5) / 127.5 - 0.5)
+        base = _ste(self.base, torch.round((self.base.clamp(-0.5, 1.5) + 0.5) * BASE_S) / BASE_S - 0.5)
         k = v[:, 6].exp().clamp(KMIN, KMAX) if self.beta else None
         return xy, feat_to_L(v[:, :3]), ycc2rgb(v[:, 3:6]), base, bits, k
 
@@ -193,7 +199,7 @@ def encode(q):
         dx = cx.copy()
         dx[1:] = np.diff(cx)
         dx[starts[counts > 0]] = cx[starts[counts > 0]]
-        base = np.round((q.base.clamp(-0.5, 1.5).cpu().numpy() + 0.5) * 127.5).astype(np.int64).reshape(-1)
+        base = np.round((q.base.clamp(-0.5, 1.5).cpu().numpy() + 0.5) * BASE_S).astype(np.int64).reshape(-1)
         enc = ac.Encoder()
         heads = [ac.put_ints(enc, s) for s in
                  [base, counts, dx, yin] + [sym[:, j] for j in range(sym.shape[1])]]
@@ -201,19 +207,23 @@ def encode(q):
             enc.raw(fx, ei)
             enc.raw(fy, ei)
         body = enc.finish()
-        head = (MAGIC_BETA if q.beta else MAGIC) + struct.pack("<HHBIf", H, W, R, N, q.k) + steps.astype(np.float32).tobytes()
+        head = MAGIC + struct.pack("<HHBIfB", H, W, R, N, q.k, int(q.beta)) + steps.astype(np.float32).tobytes()
         head += b"".join(struct.pack("<Bih", m, lo, a) for m, lo, a in heads)
         return head + body
 
 
 def decode(buf, device="cuda"):
-    assert buf[:4] in (MAGIC, MAGIC_BETA)
-    beta = buf[:4] == MAGIC_BETA
-    cut = 0.0
-    nch = 7 if beta else 6
+    mg = bytes(buf[:4])
+    assert mg in BASE_SCALE, mg
+    cut, beta = 0.0, False
     H, W, R, N, k = struct.unpack("<HHBIf", buf[4:17])
-    steps = np.frombuffer(buf[17:17 + 4 * nch], np.float32)
-    o = 17 + 4 * nch
+    o = 17
+    if mg == MAGIC:
+        beta = bool(buf[o] & 1)
+        o += 1
+    nch = 7 if beta else 6
+    steps = np.frombuffer(buf[o:o + 4 * nch], np.float32)
+    o += 4 * nch
     heads = []
     for _ in range(4 + nch):
         heads.append(struct.unpack("<Bih", buf[o:o + 7]))
@@ -238,6 +248,6 @@ def decode(buf, device="cuda"):
     xy = (u / (2.0 ** e)[:, None] - R).astype(np.float32)
     t = lambda a: torch.as_tensor(a, device=device)
     v = t(sym.astype(np.float32)) * t(steps.copy())
-    base = t(base.reshape(1, 3, bh, bw).astype(np.float32) / 127.5 - 0.5)
+    base = t(base.reshape(1, 3, bh, bw).astype(np.float32) / BASE_SCALE[mg] - 0.5)
     kb = v[:, 6].exp().clamp(KMIN, KMAX) if beta else None
     return dict(xy=t(xy), L=feat_to_L(v[:, :3]), rgb=ycc2rgb(v[:, 3:6]), base=base, H=H, W=W, R=R, cut=cut, k=kb)

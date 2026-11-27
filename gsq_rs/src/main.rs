@@ -10,6 +10,9 @@ use rayon::prelude::*;
 use std::time::Instant;
 
 const MAGIC: &[u8; 4] = b"GSQ3"; // GSQ3: per-blob patch radius min(R, ceil(CUT*sigma_max))
+const MAGIC4: &[u8; 4] = b"GSQ4"; // GSQ4: flags byte (bit 0 Beta, 7th channel log k), base step 1/510
+const KMIN: f32 = 0.25;
+const KMAX: f32 = 12.0;
 const CUT: f32 = 4.0;
 const BAND: i64 = 8;
 const EMAX: f64 = 7.0;
@@ -25,6 +28,7 @@ pub struct Blobs {
     pub bh: usize,
     pub bw: usize,
     pub cut: f32,         // 0 = full (2R+1)^2 patch (GSQ2)
+    pub k: Vec<f32>,      // Beta sharpness per blob; empty = Gaussians
 }
 
 fn rd<const N: usize>(b: &[u8], o: usize) -> [u8; N] {
@@ -32,7 +36,7 @@ fn rd<const N: usize>(b: &[u8], o: usize) -> [u8; N] {
 }
 
 /// Per-blob position precision exponent (same formula as sq.pos_exp, f64).
-fn pos_exp(sym: &[i64; 6], steps: &[f32; 6], k: f64) -> u32 {
+fn pos_exp(sym: &[i64], steps: &[f32], k: f64) -> u32 {
     let v: Vec<f64> = (0..6).map(|j| sym[j] as f64 * steps[j] as f64).collect();
     let (a, b, c) = (v[0].exp(), v[1], v[2].exp());
     let (y, co, cg) = (v[3], v[4], v[5]);
@@ -45,25 +49,34 @@ fn pos_exp(sym: &[i64; 6], steps: &[f32; 6], k: f64) -> u32 {
 }
 
 pub fn decode(buf: &[u8]) -> Result<Blobs, String> {
-    if buf.len() < 111 || (&buf[..4] != MAGIC && &buf[..4] != b"GSQ2") {
-        return Err("not a GSQ2/GSQ3 file".into());
+    if buf.len() < 18 || (&buf[..4] != MAGIC && &buf[..4] != MAGIC4 && &buf[..4] != b"GSQ2") {
+        return Err("not a GSQ2/GSQ3/GSQ4 file".into());
     }
+    let v4 = &buf[..4] == MAGIC4;
     let cut = if &buf[..4] == MAGIC { CUT } else { 0.0 };
     let h = u16::from_le_bytes(rd(buf, 4)) as usize;
     let w = u16::from_le_bytes(rd(buf, 6)) as usize;
     let r = buf[8] as usize;
     let n = u32::from_le_bytes(rd(buf, 9)) as usize;
     let k = f32::from_le_bytes(rd(buf, 13)) as f64;
-    let mut steps = [0f32; 6];
-    for (j, s) in steps.iter_mut().enumerate() {
-        *s = f32::from_le_bytes(rd(buf, 17 + 4 * j));
+    let mut o = 17;
+    let beta = v4 && buf[o] & 1 == 1;
+    if v4 {
+        o += 1;
     }
+    let nch = if beta { 7 } else { 6 };
+    let hdr = o + 4 * nch + 7 * (4 + nch);
+    if buf.len() < hdr {
+        return Err("truncated header".into());
+    }
+    let steps: Vec<f32> = (0..nch).map(|j| f32::from_le_bytes(rd(buf, o + 4 * j))).collect();
+    o += 4 * nch;
     let mut heads = Vec::new();
-    for i in 0..10 {
-        let o = 41 + 7 * i;
-        heads.push((buf[o], i32::from_le_bytes(rd(buf, o + 1)), i16::from_le_bytes(rd(buf, o + 5))));
+    for i in 0..4 + nch {
+        let p = o + 7 * i;
+        heads.push((buf[p], i32::from_le_bytes(rd(buf, p + 1)), i16::from_le_bytes(rd(buf, p + 5))));
     }
-    let mut d = ac::Decoder::new(&buf[111..]);
+    let mut d = ac::Decoder::new(&buf[hdr..]);
     let bh = 2.max(h.div_ceil(32));
     let bw = 2.max(w.div_ceil(32));
     let nb = (h + 2 * r) / BAND as usize + 1;
@@ -71,8 +84,8 @@ pub fn decode(buf: &[u8]) -> Result<Blobs, String> {
     let counts = d.ints(nb, heads[1]);
     let dx = d.ints(n, heads[2]);
     let yin = d.ints(n, heads[3]);
-    let cols: Vec<Vec<i64>> = (0..6).map(|j| d.ints(n, heads[4 + j])).collect();
-    let sym: Vec<[i64; 6]> = (0..n).map(|i| std::array::from_fn(|j| cols[j][i])).collect();
+    let cols: Vec<Vec<i64>> = (0..nch).map(|j| d.ints(n, heads[4 + j])).collect();
+    let sym: Vec<Vec<i64>> = (0..n).map(|i| (0..nch).map(|j| cols[j][i]).collect()).collect();
     let e: Vec<u32> = sym.iter().map(|s| pos_exp(s, &steps, k)).collect();
     let frac: Vec<(i64, i64)> = e.iter().map(|&ei| (d.raw(ei), d.raw(ei))).collect();
 
@@ -95,14 +108,19 @@ pub fn decode(buf: &[u8]) -> Result<Blobs, String> {
     }
     let mut l = Vec::with_capacity(n);
     let mut rgb = Vec::with_capacity(n);
+    let mut kb = Vec::new();
     for s in &sym {
-        let v: [f32; 6] = std::array::from_fn(|j| s[j] as f32 * steps[j]);
+        let v: Vec<f32> = (0..nch).map(|j| s[j] as f32 * steps[j]).collect();
+        if beta {
+            kb.push(v[6].exp().clamp(KMIN, KMAX));
+        }
         l.push([v[0].exp(), v[1], v[2].exp()]);
         let (y, co, cg) = (v[3], v[4], v[5]);
         rgb.push([y + co - cg, y + cg, y - co - cg]);
     }
-    let base = base_q.iter().map(|&q| q as f32 / 127.5 - 0.5).collect();
-    Ok(Blobs { h, w, r, xy, l, rgb, base, bh, bw, cut })
+    let bs = if v4 { 510.0 } else { 127.5 };
+    let base = base_q.iter().map(|&q| q as f32 / bs - 0.5).collect();
+    Ok(Blobs { h, w, r, xy, l, rgb, base, bh, bw, cut, k: kb })
 }
 
 /// PyTorch bicubic (A = -0.75, align_corners = False, edge clamp).
@@ -158,6 +176,7 @@ pub fn render(bl: &Blobs, scale: f32) -> (usize, usize, Vec<f32>) {
                     let (x, y) = (bl.xy[i][0] * scale, bl.xy[i][1] * scale);
                     let [a, b, c] = bl.l[i].map(|v| v * scale);
                     let col = bl.rgb[i];
+                    let kk = bl.k.get(i).copied();
                     let (cx, cy) = (x.floor() as i64, y.floor() as i64);
                     let rr = if bl.cut > 0.0 {
                         let (s11, s22) = (a * a, b * b + c * c);
@@ -174,7 +193,18 @@ pub fn render(bl: &Blobs, scale: f32) -> (usize, usize, Vec<f32>) {
                             let ox = px as f32 + 0.5 - x;
                             let u1 = ox / a;
                             let u2 = (oy - b * u1) / c;
-                            let wgt = (-0.5 * (u1 * u1 + u2 * u2)).exp();
+                            let q = u1 * u1 + u2 * u2;
+                            let wgt = match kk {
+                                None => (-0.5 * q).exp(),
+                                Some(k) => {
+                                    // (1 - q/2k)_+^k
+                                    let t = 1.0 - q * (0.5 / k);
+                                    if t <= 0.0 {
+                                        continue;
+                                    }
+                                    (k * t.max(1e-6).ln()).exp()
+                                }
+                            };
                             let p = (row + px as usize) * 3;
                             acc[p] += wgt * col[0];
                             acc[p + 1] += wgt * col[1];
